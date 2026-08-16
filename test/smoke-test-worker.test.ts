@@ -20,7 +20,7 @@ function runSmoke(opts: { supervisorRunning: boolean; legacyPid?: number }) {
 printf '%s\\n' "$*" >> "$SMOKE_BUN_CALLS"
 case " $* " in
   *" --help "*) exit 0 ;;
-  *" doctor "*) printf '%s\\n' 'Health Check'; exit 0 ;;
+  *" doctor "*) printf '%s\\n' 'GBrain Health Check' 'Health score: 97'; exit 0 ;;
   *" jobs supervisor status --json "*)
     if [ "$SMOKE_SUPERVISOR_RUNNING" = 1 ]; then
       printf '%s\\n' '{"running":true,"detected_via":"pidfile"}'
@@ -65,6 +65,8 @@ describe('smoke-test worker health (#4175)', () => {
     const result = runSmoke({ supervisorRunning: true });
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('health score: 97/100');
+    expect(result.stderr).not.toContain('invalid option');
     expect(result.stdout).toContain('GBrain worker (supervisor-managed)');
     expect(readFileSync(result.calls, 'utf8')).toContain('jobs supervisor status --json');
     expect(existsSync(result.workerStarted)).toBe(false);

@@ -17,6 +17,8 @@ worker therefore passes without creating a second unmanaged process.
   topology that requires operator review.
 - Smoke-test worker detection is hermetically covered without touching live
   processes or global PID files.
+- Doctor health-score extraction uses POSIX `sed` instead of GNU-only
+  `grep -P`, eliminating the macOS warning and `?/100` fallback.
 
 No migration or configuration change is required.
 
