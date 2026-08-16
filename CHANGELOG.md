@@ -2,6 +2,21 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.46.6.2] - 2026-08-15
+
+**Large JSON pipelines no longer report success after truncating at 64 KiB.**
+The CLI now waits for the callback attached to the actual non-empty payload for
+`--tools-json` and formatted operation results. Bun elides the previous empty
+write fence under pipe backpressure, allowing the process to exit 0 while a
+slow consumer received only the first 65,536 bytes. A blocked or broken
+consumer now produces a bounded nonzero failure instead of false success.
+
+### Fixed
+- Complete delivery of large local and remote operation results through pipes.
+- Complete, parseable `gbrain --tools-json` output for slow downstream tools.
+
+No migration or configuration change is required.
+
 ## [0.46.6.0] - 2026-08-15
 
 **A busy machine can no longer make the job queue evict its own healthy
