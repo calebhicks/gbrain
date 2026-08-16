@@ -136,4 +136,15 @@ describe('loadSynthConfig — triage knob clamps and floors (#4152)', () => {
     const set = await __testing.loadSynthConfig(stubEngine({ 'dream.synthesize.max_submissions_per_source_per_day': '200' }));
     expect(set.maxSubmissionsPerSourcePerDay).toBe(200);
   });
+
+  test('inline concurrency defaults to 1 and clamps to [1,8]', async () => {
+    const dflt = await __testing.loadSynthConfig(stubEngine({}));
+    expect(dflt.inlineConcurrency).toBe(1);
+    const low = await __testing.loadSynthConfig(stubEngine({ 'dream.synthesize.inline_concurrency': '0' }));
+    expect(low.inlineConcurrency).toBe(1);
+    const set = await __testing.loadSynthConfig(stubEngine({ 'dream.synthesize.inline_concurrency': '4' }));
+    expect(set.inlineConcurrency).toBe(4);
+    const high = await __testing.loadSynthConfig(stubEngine({ 'dream.synthesize.inline_concurrency': '99' }));
+    expect(high.inlineConcurrency).toBe(8);
+  });
 });

@@ -55,7 +55,8 @@ import { MinionQueue } from '../minions/queue.ts';
 import { reconnectAfterConnectionError } from '../minions/reconnect.ts';
 import { isRetryableConnError } from '../retry-matcher.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
-import { makeSubagentHandler } from '../minions/handlers/subagent.ts';
+import { makeSubagentHandler, RateLeaseUnavailableError } from '../minions/handlers/subagent.ts';
+import { logLeasePressure } from '../minions/lease-pressure-audit.ts';
 import type { MinionJobInput, MinionJobContext, MinionHandler, SubagentHandlerData } from '../minions/types.ts';
 import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
@@ -407,6 +408,40 @@ export async function runSubagentsInline(
   yieldDuringPhase?: () => Promise<void>,
   handler: MinionHandler = makeSubagentHandler({ engine }),
   lockMs: number = INLINE_LOCK_MS,
+  requestedConcurrency: number = 1,
+): Promise<void> {
+  // PGLite owns an exclusive embedded engine and remains strictly serial.
+  // Postgres can safely claim distinct rows with SKIP LOCKED; keep the pool
+  // deliberately small even when a malformed direct caller passes a large
+  // value. Provider-side rate leases remain the API concurrency ceiling.
+  const concurrency = engine.kind === 'postgres'
+    ? Math.max(1, Math.min(8, Math.floor(requestedConcurrency) || 1))
+    : 1;
+  // Do not let Promise.all return while sibling workers are still mutating the
+  // private queue after one worker hits a fatal error. Drain every started
+  // worker to quiescence, then surface the first failure to the parent phase.
+  const outcomes = await Promise.allSettled(
+    Array.from({ length: concurrency }, () => drainSubagentsInlineWorker(
+      engine,
+      queue,
+      queueName,
+      yieldDuringPhase,
+      handler,
+      lockMs,
+    )),
+  );
+  const failedWorker = outcomes.find((outcome): outcome is PromiseRejectedResult =>
+    outcome.status === 'rejected');
+  if (failedWorker) throw failedWorker.reason;
+}
+
+async function drainSubagentsInlineWorker(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  queueName: string,
+  yieldDuringPhase: (() => Promise<void>) | undefined,
+  handler: MinionHandler,
+  lockMs: number,
 ): Promise<void> {
   // #3555 interaction: the drain's queue ops used to be bare awaits, so a
   // transient pooler reap mid-drain threw out of the loop and stranded the
@@ -569,6 +604,35 @@ export async function runSubagentsInline(
           lockToken,
           result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined,
         );
+        return;
+      }
+      // Worker parity: provider capacity is backpressure, not a failed
+      // attempt. Wait locally while this private-queue worker still owns and
+      // renews the claim, then release it with zero DB delay so the next loop
+      // can promote/reclaim it. A future delay_until would strand the job when
+      // the other private drain workers see an empty queue and exit.
+      if (handlerErr instanceof RateLeaseUnavailableError) {
+        const leaseBackoffMs = 1000 + Math.floor(Math.random() * 2000);
+        await new Promise((r) => setTimeout(r, leaseBackoffMs));
+        const released = await queue.releaseLeaseFullJob(
+          job.id,
+          lockToken,
+          handlerErr.message,
+          0,
+        );
+        if (released) {
+          await logLeasePressure(engine, {
+            job_id: job.id,
+            lease_key: handlerErr.key,
+            active_at_bounce: handlerErr.active,
+            max_concurrent: Number.isFinite(handlerErr.max) ? handlerErr.max : -1,
+            queue_name: job.queue,
+            job_name: job.name,
+            model: null,
+            provider: null,
+            root_owner_id: job.parent_job_id ?? null,
+          });
+        }
         return;
       }
       // Timeout is terminal (handleTimeouts parity: stall → retry,
@@ -1000,7 +1064,15 @@ export async function runPhaseSynthesize(
     // terminal child states instead of polling waiters until
     // subagentWaitTimeoutMs expires. Runs on BOTH engines — on Postgres the
     // parent job otherwise deadlocks a fully-occupied worker (#2050).
-    await runSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
+    await runSubagentsInline(
+      engine,
+      queue,
+      childQueueName,
+      opts.yieldDuringPhase,
+      undefined,
+      undefined,
+      config.inlineConcurrency,
+    );
 
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
     // every 5 min so the cycle lock TTL refreshes.
@@ -1092,6 +1164,8 @@ export async function runPhaseSynthesize(
       triage: triageDetails,
       synthesis: {
         jobs: childIds.length,
+        inline_concurrency_config: config.inlineConcurrency,
+        inline_concurrency_effective: engine.kind === 'postgres' ? config.inlineConcurrency : 1,
         max_turns_config: config.maxTurns,
         avg_turns: turnsSamples.length > 0
           ? Math.round((turnsSamples.reduce((a, o) => a + o.turns, 0) / turnsSamples.length) * 10) / 10
@@ -1157,6 +1231,8 @@ export interface SynthConfig {
   outputRoot: string;
   subagentTimeoutMs: number;
   subagentWaitTimeoutMs: number;
+  /** Postgres-only private-queue drain pool; PGLite always remains serial. */
+  inlineConcurrency: number;
 }
 
 /** #2415: shared output-root resolution (synthesize + patterns phases). */
@@ -1233,6 +1309,8 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     'dream.synthesize.subagent_wait_timeout_ms',
     DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS,
   );
+  const inlineConcurrency = Math.max(1, Math.min(8,
+    Math.floor(await getNumberConfig(engine, 'dream.synthesize.inline_concurrency', 1)) || 1));
 
   let excludePatterns: string[] = [...DEFAULT_EXCLUDE_PATTERNS];
   if (excludeStr) {
@@ -1282,6 +1360,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     outputRoot: await loadOutputRoot(engine),
     subagentTimeoutMs,
     subagentWaitTimeoutMs,
+    inlineConcurrency,
   };
 }
 

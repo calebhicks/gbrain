@@ -148,6 +148,10 @@ per-transcript synthesis subagents. The dials:
 - `dream.synthesize.max_submissions_per_source_per_day` (default 0 = off) —
   opt-in backstop cap on synthesis jobs per source; 200/day is a sane value
   for busy deployments.
+- `dream.synthesize.inline_concurrency` (default 1, clamped 1–8) — bounded
+  Postgres-only parallelism for the private synthesis queue. PGLite always
+  remains serial. Increase gradually and keep the value within the available
+  DB pool and provider-rate budget; provider rate leases remain authoritative.
 
 Maintenance recipe — after changing the threshold, upgrading through a
 `TRIAGE_VERSION` bump, or to drain a queued synthesis backlog:

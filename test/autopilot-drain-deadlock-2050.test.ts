@@ -27,6 +27,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { runPhasePatterns } from '../src/core/cycle/patterns.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
+import { RateLeaseUnavailableError } from '../src/core/minions/handlers/subagent.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
@@ -146,6 +147,154 @@ describe('#2050 — patterns parent must not deadlock on its own child (postgres
     const after = await queue.getJob(job.id);
     expect(after?.status).toBe('completed');
     expect(sweptWhileRunning).toBe(0);
+  }, 30_000);
+
+  test('Postgres inline drain overlaps children up to the requested bound', async () => {
+    const { __testing } = await import('../src/core/cycle/synthesize.ts');
+    const drain = (__testing as Record<string, unknown>).runSubagentsInline;
+    const pgAlike = maskAsPostgres(engine);
+    const queue = new MinionQueue(pgAlike);
+    const queueName = 'inline-2050-concurrency';
+    const ids: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const job = await queue.add(
+        'subagent',
+        { prompt: `noop-${i}`, model: 'anthropic:claude-sonnet-4-5', max_turns: 1 },
+        { queue: queueName, max_stalled: 3 },
+        { allowProtectedSubmit: true },
+      );
+      ids.push(job.id);
+    }
+
+    let active = 0;
+    let peak = 0;
+    const stub = async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 80));
+      active--;
+      return { ok: true };
+    };
+
+    await (drain as (
+      e: BrainEngine, q: MinionQueue, name: string,
+      y?: () => Promise<void>, h?: unknown, lockMs?: number, concurrency?: number,
+    ) => Promise<void>)(pgAlike, queue, queueName, undefined, stub, 1000, 2);
+
+    expect(peak).toBe(2);
+    for (const id of ids) expect((await queue.getJob(id))?.status).toBe('completed');
+  }, 30_000);
+
+  test('PGLite inline drain stays serial even when a larger bound is requested', async () => {
+    const { __testing } = await import('../src/core/cycle/synthesize.ts');
+    const drain = (__testing as Record<string, unknown>).runSubagentsInline;
+    const queue = new MinionQueue(engine);
+    const queueName = 'inline-2050-pglite-serial';
+    for (let i = 0; i < 3; i++) {
+      await queue.add(
+        'subagent',
+        { prompt: `noop-${i}`, model: 'anthropic:claude-sonnet-4-5', max_turns: 1 },
+        { queue: queueName, max_stalled: 3 },
+        { allowProtectedSubmit: true },
+      );
+    }
+
+    let active = 0;
+    let peak = 0;
+    const stub = async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 30));
+      active--;
+      return { ok: true };
+    };
+
+    await (drain as (
+      e: BrainEngine, q: MinionQueue, name: string,
+      y?: () => Promise<void>, h?: unknown, lockMs?: number, concurrency?: number,
+    ) => Promise<void>)(engine, queue, queueName, undefined, stub, 1000, 4);
+
+    expect(peak).toBe(1);
+  }, 30_000);
+
+  test('provider lease pressure retries without burning a job attempt', async () => {
+    const { __testing } = await import('../src/core/cycle/synthesize.ts');
+    const drain = (__testing as Record<string, unknown>).runSubagentsInline;
+    const pgAlike = maskAsPostgres(engine);
+    const queue = new MinionQueue(pgAlike);
+    const queueName = 'inline-2050-lease-pressure';
+    const job = await queue.add(
+      'subagent',
+      { prompt: 'noop', model: 'anthropic:claude-sonnet-4-5', max_turns: 1 },
+      { queue: queueName, max_stalled: 3 },
+      { allowProtectedSubmit: true },
+    );
+
+    let calls = 0;
+    const stub = async () => {
+      calls++;
+      if (calls === 1) throw new RateLeaseUnavailableError('anthropic:messages', 1, 1);
+      return { ok: true };
+    };
+
+    await (drain as (
+      e: BrainEngine, q: MinionQueue, name: string,
+      y?: () => Promise<void>, h?: unknown, lockMs?: number, concurrency?: number,
+    ) => Promise<void>)(pgAlike, queue, queueName, undefined, stub, 5000, 2);
+
+    const after = await queue.getJob(job.id);
+    expect(calls).toBe(2);
+    expect(after?.status).toBe('completed');
+    expect(after?.attempts_made).toBe(0);
+    const pressure = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM minion_lease_pressure_log WHERE job_id = $1`,
+      [job.id],
+    );
+    expect(pressure[0]?.n).toBe(1);
+  }, 30_000);
+
+  test('a fatal worker error waits for sibling drain workers to quiesce', async () => {
+    const { __testing } = await import('../src/core/cycle/synthesize.ts');
+    const drain = (__testing as Record<string, unknown>).runSubagentsInline;
+    const pgAlike = maskAsPostgres(engine);
+    const queue = new MinionQueue(pgAlike);
+    const queueName = 'inline-2050-fatal-sibling';
+    const ids: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const job = await queue.add(
+        'subagent',
+        { prompt: `noop-${i}`, model: 'anthropic:claude-sonnet-4-5', max_turns: 1 },
+        { queue: queueName, max_stalled: 3 },
+        { allowProtectedSubmit: true },
+      );
+      ids.push(job.id);
+    }
+
+    let claims = 0;
+    const realClaim = queue.claim.bind(queue);
+    queue.claim = (async (...args: Parameters<MinionQueue['claim']>) => {
+      if (claims++ === 0) throw new Error('fatal queue invariant');
+      return realClaim(...args);
+    }) as MinionQueue['claim'];
+
+    const run = (drain as (
+      e: BrainEngine, q: MinionQueue, name: string,
+      y?: () => Promise<void>, h?: unknown, lockMs?: number, concurrency?: number,
+    ) => Promise<void>)(
+      pgAlike,
+      queue,
+      queueName,
+      undefined,
+      async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        return { ok: true };
+      },
+      1000,
+      2,
+    );
+
+    await expect(run).rejects.toThrow('fatal queue invariant');
+    for (const id of ids) expect((await queue.getJob(id))?.status).toBe('completed');
   }, 30_000);
 
   // #3555 interaction: the drain's queue ops must survive a transient pooler
