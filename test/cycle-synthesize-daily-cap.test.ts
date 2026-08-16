@@ -4,7 +4,8 @@
  *
  * PGLite, no API key required: verdicts are pre-seeded so the triage pass is
  * all cache hits, and submitted subagent jobs are auto-cancelled so the
- * phase's inline wait returns immediately.
+ * phase's inline wait returns immediately. Required-child cancellation is
+ * therefore the expected parent failure whenever a child was submitted.
  *
  * Run: bun test test/cycle-synthesize-daily-cap.test.ts
  */
@@ -146,8 +147,14 @@ async function runPhase(rig: Rig, opts: { date?: string; excludeQueue?: string }
       withSubagentAutoCancel(rig.engine, () =>
         runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false, ...phaseOpts }),
       { excludeQueue }));
-    expect(result.status).toBe('ok');
-    return result.details as unknown as CapDetails;
+    const details = result.details as unknown as CapDetails;
+    if (details.children_submitted > 0) {
+      expect(result.status).toBe('fail');
+      expect(result.error?.code).toBe('SYNTH_CHILD_FAILURES');
+    } else {
+      expect(result.status).toBe('ok');
+    }
+    return details;
   } finally {
     try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* */ }
   }

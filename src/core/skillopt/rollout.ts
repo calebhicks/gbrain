@@ -55,7 +55,7 @@ export interface RolloutOpts {
 
 /**
  * Run one rollout. Returns a Trajectory; never throws on agent-side failures
- * (max_turns, refusal, aborted) — those land in `trajectory.stop_reason` so
+ * (max_turns, length, refusal, aborted) — those land in `trajectory.stop_reason` so
  * the caller can score them appropriately.
  *
  * Throws ONLY on infrastructure errors (no engine, unknown target model) or

@@ -1122,14 +1122,14 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   });
 
   // Map gateway stop reason to SubagentStopReason. SubagentStopReason has
-  // {end_turn, max_turns, refusal, error}; aborted maps to error.
+  // {end_turn, max_turns, max_tokens, refusal, error}; aborted maps to error.
   const stopReason: SubagentStopReason = result.stopReason === 'end'
     ? 'end_turn'
     : result.stopReason === 'max_turns'
       ? 'max_turns'
-      : result.stopReason === 'refusal'
-        ? 'refusal'
-        : result.stopReason === 'content_filter'
+      : result.stopReason === 'length'
+        ? 'max_tokens'
+        : result.stopReason === 'refusal' || result.stopReason === 'content_filter'
           ? 'refusal'
           : result.stopReason === 'aborted'
             ? 'error'

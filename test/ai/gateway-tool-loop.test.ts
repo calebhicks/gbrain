@@ -339,4 +339,24 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     expect(result.stopReason).toBe('refusal');
     expect(result.finalText).toBe('I cannot help with that');
   });
+
+  it('preserves a provider length stop instead of reporting a clean end', async () => {
+    __setChatTransportForTests(async () => ({
+      text: 'truncated output',
+      blocks: [{ type: 'text', text: 'truncated output' }] as ChatBlock[],
+      stopReason: 'length',
+      usage: { input_tokens: 5, output_tokens: 4096, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-sonnet-4-6',
+      providerId: 'anthropic',
+    }));
+
+    const result = await toolLoop({
+      initialMessages: [{ role: 'user', content: 'long request' }],
+      tools: [],
+      toolHandlers: new Map(),
+    });
+
+    expect(result.stopReason).toBe('length');
+    expect(result.finalText).toBe('truncated output');
+  });
 });

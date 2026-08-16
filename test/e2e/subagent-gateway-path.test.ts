@@ -350,6 +350,24 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(result.result).toBe('I cannot help with that');
   });
 
+  it('length stop reason: handler maps truncation → SubagentStopReason max_tokens', async () => {
+    __setChatTransportForTests(async () => ({
+      text: 'truncated output',
+      blocks: [{ type: 'text', text: 'truncated output' }] as ChatBlock[],
+      stopReason: 'length',
+      usage: { input_tokens: 5, output_tokens: 4096, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-sonnet-4-6',
+      providerId: 'anthropic',
+    } satisfies ChatResult));
+
+    const handler = buildHandler(makeStubTools([]));
+    const { ctx } = await makeFakeJob({ prompt: 'long request', model: 'anthropic:claude-sonnet-4-6' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('max_tokens');
+    expect(result.result).toBe('truncated output');
+  });
+
   it('non-Anthropic model routes through gateway path (the load-bearing v0.38 unlock)', async () => {
     // This is the headline scenario: openai:gpt-5.2 (no caching) works.
     // Pre-v0.38, this would have refused at queue.ts. With the gateway path

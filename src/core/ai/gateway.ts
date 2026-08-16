@@ -3618,7 +3618,7 @@ export interface ToolLoopOpts {
   onHeartbeat?: (event: string, data: Record<string, unknown>) => void;
 }
 
-export type ToolLoopStopReason = 'end' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
+export type ToolLoopStopReason = 'end' | 'max_turns' | 'length' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
 
 export interface ToolLoopResult {
   finalText: string;
@@ -3706,13 +3706,12 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
     messages.push({ role: 'assistant', content: chatResult.blocks });
 
     // Check stop reason BEFORE tool dispatch. The loop only continues on tool_calls.
-    if (chatResult.stopReason === 'refusal') {
-      stopReason = 'refusal';
-      finalText = chatResult.text;
-      break;
-    }
-    if (chatResult.stopReason === 'content_filter') {
-      stopReason = 'content_filter';
+    // Preserve terminal non-success reasons instead of collapsing them into
+    // the no-tool `end` branch; subagent maps provider length to max_tokens.
+    if (chatResult.stopReason === 'refusal'
+        || chatResult.stopReason === 'content_filter'
+        || chatResult.stopReason === 'length') {
+      stopReason = chatResult.stopReason;
       finalText = chatResult.text;
       break;
     }

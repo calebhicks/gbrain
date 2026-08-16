@@ -574,7 +574,10 @@ describe('E2E synthesize — fan-out self-heal for stranded coalesced rows (#415
         // poller firing between coalesce and cancelJob hard-fails the test.
         await withSubagentAutoCancel(rig.engine, async () => {
           const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
-          expect(result.status).toBe('ok');
+          // The self-heal re-adds the row, then this test's poller
+          // deliberately cancels the fresh required child.
+          expect(result.status).toBe('fail');
+          expect(result.error?.code).toBe('SYNTH_CHILD_FAILURES');
           const details = result.details as { children_submitted: number };
           expect(details.children_submitted).toBe(1);
         }, { excludeQueue: 'dream-inline-1700000000000-deadbeef' });
@@ -624,7 +627,17 @@ describe('E2E synthesize — fan-out self-heal for stranded coalesced rows (#415
       await withoutAnthropicKey(async () => {
         await withSubagentAutoCancel(rig.engine, async () => {
           const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
-          expect(result.status).toBe('ok'); // child outcome is 'timeout', phase still completes
+          // The young foreign row remains untouched, but the parent wait
+          // times out. A required timeout is an honest phase failure.
+          expect(result.status).toBe('fail');
+          expect(result.error?.code).toBe('SYNTH_CHILD_FAILURES');
+          expect(result.error?.class).toBe('Timeout');
+          const receipt = result.details.child_receipt as {
+            counts: { completed: number; failed: number; timed_out: number };
+            timed_out_ids: number[];
+          };
+          expect(receipt.counts).toEqual({ completed: 0, failed: 0, timed_out: 1 });
+          expect(receipt.timed_out_ids).toEqual([seeded[0].id]);
         }, { excludeQueue: liveQueue });
       });
       const rows = await rig.engine.executeRaw<{ id: number; status: string; queue: string }>(

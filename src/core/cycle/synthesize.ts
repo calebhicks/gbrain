@@ -63,6 +63,14 @@ import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
+import {
+  buildSynthesizeDetails,
+  makeRequiredChildFailure,
+  releaseUnsuccessfulCompletedChildKeys,
+  summarizeRequiredChildOutcomes,
+  toChildOutcome,
+  type ChildOutcomeLike,
+} from './synthesize-child-outcomes.ts';
 
 // Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
 // Used for the orchestrator-written summary index slug. `u` flag required
@@ -102,7 +110,6 @@ const DEFAULT_MAX_CHUNKS = 24;
 const UNKNOWN_MODEL_BUDGET_TOKENS = 180_000;
 const DEFAULT_SUBAGENT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS = 35 * 60 * 1000;
-
 // ── Triage-v1 constants (#4152) ───────────────────────────────────────
 
 /**
@@ -1004,7 +1011,7 @@ export async function runPhaseSynthesize(
 
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
     // every 5 min so the cycle lock TTL refreshes.
-    const childOutcomes: Array<{ jobId: number; status: string; turns?: number }> = [];
+    const childOutcomes: ChildOutcomeLike[] = [];
     for (const jobId of childIds) {
       try {
         const job = await waitForCompletion(queue, jobId, {
@@ -1013,14 +1020,13 @@ export async function runPhaseSynthesize(
         });
         // Turn telemetry: surfaces max_turns cap pressure in details.synthesis
         // so the 30→16 default can be re-litigated on data.
-        const turns = (job.result as { turns_count?: unknown } | null | undefined)?.turns_count;
-        childOutcomes.push({
-          jobId,
-          status: job.status,
-          ...(typeof turns === 'number' && Number.isFinite(turns) ? { turns } : {}),
-        });
+        childOutcomes.push(toChildOutcome(jobId, job.status, job.result));
       } catch (e) {
         if (e instanceof TimeoutError) {
+          // The inline drain settles every child owned by this run before we
+          // enter this loop. A remaining timeout is therefore a coalesced row
+          // in a young foreign dream-inline queue that may still have a live
+          // owner. Record the timeout, but do not cancel another cycle's job.
           childOutcomes.push({ jobId, status: 'timeout' });
         } else {
           throw e;
@@ -1054,11 +1060,31 @@ export async function runPhaseSynthesize(
     // Dual-write: reverse-render each DB row → markdown file.
     const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
 
+    const childReceipt = summarizeRequiredChildOutcomes(childOutcomes);
+    const releasedRetryKeys = childReceipt.has_failures
+      ? await releaseUnsuccessfulCompletedChildKeys(engine, childOutcomes)
+      : 0;
+
     // Summary index page (deterministic; orchestrator-written via direct
-    // engine.putPage so no allow-list path needed).
+    // engine.putPage so no allow-list path needed). A failed required child
+    // may have written partial pages, but must not refresh this success
+    // artifact or the cooldown timestamp.
     const summarySlug = `dream-cycle-summaries/${summaryDate}`;
     // Back-compat: writeSummaryPage takes string[] for display; map refs back to slugs.
     const writtenSlugs = writtenRefs.map(r => r.slug);
+
+    const ms = Date.now() - start;
+    const submittedTranscripts = worthProcessing.length - skipReports.length;
+    const details = buildSynthesizeDetails({
+      transcriptsDiscovered: transcripts.length, transcriptsProcessed: submittedTranscripts,
+      writtenSlugs, reverseWriteCount, childOutcomes, childReceipt, releasedRetryKeys,
+      childrenSubmitted: childIds.length, skips: skipReports, verdicts,
+      triage: triageDetails, maxTurns: config.maxTurns, summarySlug,
+    });
+
+    const childFailure = makeRequiredChildFailure(childReceipt, ms, details);
+    if (childFailure) return childFailure;
+
     if (SUMMARY_SLUG_RE.test(summarySlug)) {
       await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes, cycleSourceId);
     }
@@ -1066,38 +1092,7 @@ export async function runPhaseSynthesize(
     // Write completion timestamp ON SUCCESS only.
     await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
 
-    const ms = Date.now() - start;
-    const submittedTranscripts = worthProcessing.length - skipReports.length;
-    const turnsSamples = childOutcomes.filter(
-      (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
-    );
-    return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
-      transcripts_discovered: transcripts.length,
-      transcripts_processed: submittedTranscripts,
-      pages_written: writtenSlugs.length,
-      // v0.29: emit the slug list so the recompute_emotional_weight phase can
-      // union with sync's pagesAffected and recompute weights for every page
-      // synthesize wrote in this cycle.
-      written_slugs: writtenSlugs,
-      reverse_write_count: reverseWriteCount,
-      child_outcomes: childOutcomes,
-      // Children submitted (one per chunk for chunked transcripts; one per
-      // transcript for single-chunk). Differs from transcripts_processed
-      // when chunking is in play.
-      children_submitted: childIds.length,
-      // D5 cap hits + D8 legacy-key skips + daily_cap_reached. Empty when nothing skipped.
-      skips: skipReports,
-      summary_slug: summarySlug,
-      verdicts,
-      triage: triageDetails,
-      synthesis: {
-        jobs: childIds.length,
-        max_turns_config: config.maxTurns,
-        avg_turns: turnsSamples.length > 0
-          ? Math.round((turnsSamples.reduce((a, o) => a + o.turns, 0) / turnsSamples.length) * 10) / 10
-          : null,
-      },
-    });
+    return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, details);
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
       e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
@@ -2613,4 +2608,6 @@ export const __testing = {
   reverseWriteRefs,
   runSubagentsInline,
   loadSynthConfig,
+  summarizeRequiredChildOutcomes,
+  releaseUnsuccessfulCompletedChildKeys,
 };
