@@ -28,7 +28,7 @@ import { operations, OperationError } from './core/operations.ts';
 import { resolveSourceIdEngineFree } from './core/source-resolver.ts';
 import { formatVolunteeredPage } from './core/context/volunteer.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
-import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict } from './core/cli-force-exit.ts';
+import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict, writeStdoutFully } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
 import { conceptNudge } from './core/search/query-intent.ts';
@@ -362,7 +362,7 @@ async function main() {
 
   if (command === '--tools-json') {
     const { printToolsJson } = await import('./commands/tools-json.ts');
-    printToolsJson();
+    await printToolsJson();
     return;
   }
 
@@ -658,7 +658,7 @@ async function main() {
     // Buffer → object. Microsecond-cost; eliminates a whole drift bug class.
     const result = normalizeLocalResult(rawResult);
     const output = formatResult(op.name, result, params);
-    if (output) process.stdout.write(output);
+    if (output) await writeStdoutFully(output);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     // v0.42.20.0 (codex D4): on error, set exitCode + return so the `finally`
@@ -746,7 +746,7 @@ async function runThinClientRouted(
     if (envelopeMeta?.retrieval) captureRetrievalMeta('retrieval', envelopeMeta.retrieval);
     const result = unpackToolResult(raw);
     const output = formatResult(op.name, result, params);
-    if (output) process.stdout.write(output);
+    if (output) await writeStdoutFully(output);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     if (e instanceof RemoteMcpError) {

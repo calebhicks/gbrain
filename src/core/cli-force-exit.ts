@@ -32,10 +32,10 @@
  *           │
  *           ▼  (exactly ONE place: cli.ts import.meta.main main().then/catch)
  *   shouldForceExitAfterMain() && flushThenExit(currentExitCode())
- *     — fence stdout+stderr (write-fence raced with an unref'd guard,
- *       EPIPE-safe), hold a short REF'D aliveness grace for non-TTY stdio
- *       (Bun only delivers queued pipe writes while alive), then
- *       process.exit. Stuck sockets become irrelevant.
+ *     — large shared output seams have already awaited `writeStdoutFully`
+ *       (the callback on the actual non-empty payload); fence any remaining
+ *       stdout+stderr writes, hold a short REF'D aliveness grace for non-TTY
+ *       stdio, then process.exit. Stuck sockets become irrelevant.
  *
  * The hard-deadline timer is armed at TEARDOWN start, never before the op
  * handler — a slow-but-healthy handler must not erode the teardown budget
@@ -90,8 +90,9 @@ const FLUSH_GUARD_MS = 2_000;
  * Empirically verified (#2084 probes): Bun's process.stdout queues pipe writes
  * in a native writer that only pushes to the fd on event-loop turns WHILE THE
  * PROCESS IS ALIVE — process.exit discards the queue, natural event-loop exit
- * discards it too, and no API reaches it (write callbacks fire on accept, not
- * delivery; writableLength/bytesWritten read 0 throughout;
+ * discards it too. An EMPTY write callback does not reach it (Bun elides that
+ * fence), while the callback on an actual non-empty payload does; the stream's
+ * writableLength/bytesWritten read 0 throughout;
  * Bun.stdout.writer().flush() is a different writer; fs.writeSync(1) is also
  * queued). Staying alive briefly is the ONLY flush. TTY writes are synchronous
  * — no grace needed there.
@@ -102,9 +103,9 @@ const FLUSH_GRACE_PIPE_MS = 250;
  * Resolve the non-TTY aliveness grace: `GBRAIN_FLUSH_GRACE_MS` env override
  * (incident/batch escape hatch, same env-only pattern as
  * GBRAIN_TEARDOWN_DEADLINE_MS) over the 250ms default. Consumers piping LARGE
- * payloads into slow readers (a reader that attaches later than the grace
- * loses the tail — Bun gives no delivery signal to wait on) can raise it;
- * high-frequency agent loops capturing to files can lower it.
+ * untracked output into slow readers can raise it; shared catalog and
+ * operation-result payloads use `writeStdoutFully` instead. High-frequency
+ * agent loops capturing to files can lower it.
  */
 function resolveFlushGraceMs(): number {
   const env = Number(process.env.GBRAIN_FLUSH_GRACE_MS);
@@ -169,6 +170,46 @@ export interface MinimalWritable {
 }
 
 /**
+ * Write a CLI payload and wait for the callback attached to THAT payload.
+ *
+ * Bun elides an empty `write('', cb)` fence: under pipe backpressure its
+ * callback can fire while an earlier large write still has bytes queued. The
+ * callback on the non-empty payload itself does not have that bug. Await it at
+ * shared large-output seams before the central bounded exit sequence begins.
+ * A consumer that never reads is still bounded; timeout/EPIPE rejects so the
+ * CLI cannot report success after partial delivery.
+ */
+export function writeStdoutFully(
+  chunk: string,
+  opts: { stdout?: MinimalWritable; timeoutMs?: number } = {},
+): Promise<void> {
+  const stdout = opts.stdout ?? process.stdout;
+  const timeoutMs = opts.timeoutMs ?? FLUSH_GUARD_MS;
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`[cli] stdout write did not complete within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    try {
+      stdout.once?.('error', (error: unknown) =>
+        finish(error instanceof Error ? error : new Error(String(error))),
+      );
+      stdout.write(chunk, (error) => finish(error));
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+/**
  * #2084 — the CLI's exit verdict lives in a gbrain-OWNED variable, never read
  * back from `process.exitCode`. PGLite's Emscripten runtime writes its own
  * status into `process.exitCode` at arbitrary points DURING a run (99 at
@@ -214,16 +255,16 @@ export interface FlushThenExitOpts {
  *
  * Two stages, both bounded:
  *  1. Fence: an empty `write('', cb)` per stream serializes behind the accept
- *     queue; an unref'd guard bounds a stream whose callback never fires.
- *     (In Bun the callback fires on ACCEPT, not delivery — the fence alone is
- *     NOT sufficient; verified in the #2084 probes.)
+ *     queue; an unref'd guard bounds a stream whose callback never fires. Bun
+ *     elides this empty write, so it is only a fallback for remaining small
+ *     writes; large shared payloads await their own non-empty callback first.
  *  2. Aliveness grace: a REF'D timer keeps the process alive `graceMs` so
  *     Bun's native writer can push the queued bytes to the fd / a consuming
  *     reader (#1959 truncation class). TTY stdio skips this (sync writes).
  *
- * A reader that consumes nothing for longer than guard+grace loses the tail —
- * unavoidable without waiting forever; strictly better than the pre-#2084
- * behavior (immediate process.exit discarded everything still queued).
+ * A reader that consumes nothing for longer than the bounded payload-write
+ * deadline plus guard+grace gets a nonzero producer result rather than a false
+ * success; untracked writes still retain the pre-#3423 bounded fallback.
  *
  * `process.exitCode` is set up front so that even a stubbed `exit` (tests) or
  * a natural event-loop exit keeps the right code.

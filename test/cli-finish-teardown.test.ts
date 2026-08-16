@@ -19,6 +19,7 @@ import {
   setCliExitVerdict,
   currentExitCode,
   _resetCliExitVerdictForTests,
+  writeStdoutFully,
   type MinimalWritable,
 } from '../src/core/cli-force-exit.ts';
 import { POOL_END_TIMEOUT_SECONDS } from '../src/core/db.ts';
@@ -387,6 +388,46 @@ describe('finishCliTeardown — disconnect failure (D3: exit code reports the op
     expect(warns.length).toBe(1);
     expect(warns[0]).toContain('pool already dead');
     expect(exits).toEqual([]); // helper never exits on the non-backstop path
+  });
+});
+
+describe('writeStdoutFully', () => {
+  test('waits for the callback attached to the non-empty payload', async () => {
+    let callback: ((error?: Error | null) => void) | undefined;
+    const writes: string[] = [];
+    const stream: MinimalWritable = {
+      write(chunk, cb) {
+        writes.push(chunk);
+        callback = cb;
+        return false;
+      },
+      once() {
+        return this;
+      },
+    };
+
+    let settled = false;
+    const pending = writeStdoutFully('actual payload', { stdout: stream, timeoutMs: 1000 })
+      .then(() => { settled = true; });
+    await sleep(20);
+    expect(writes).toEqual(['actual payload']);
+    expect(settled).toBe(false);
+    callback?.();
+    await pending;
+    expect(settled).toBe(true);
+  });
+
+  test('rejects when a blocked consumer never acknowledges the payload', async () => {
+    const blocked: MinimalWritable = {
+      write() {
+        return false;
+      },
+      once() {
+        return this;
+      },
+    };
+    await expect(writeStdoutFully('payload', { stdout: blocked, timeoutMs: 30 }))
+      .rejects.toThrow('stdout write did not complete within 30ms');
   });
 });
 
