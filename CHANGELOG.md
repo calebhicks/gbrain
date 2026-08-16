@@ -2,6 +2,23 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.46.6.3] - 2026-08-15
+
+**Delivered reflex pointers are now reliably counted in context-usage
+telemetry.** The reflex delivery path used a dynamic import before registering
+its background INSERT. An immediate CLI teardown could therefore drain an
+empty snapshot and disconnect before the event write was visible to the sink.
+Registration is now synchronous while the INSERT remains non-blocking and
+fail-open.
+
+### Fixed
+- Reflex-channel volunteer events no longer disappear during immediate
+  teardown.
+- Context precision statistics retain delivered reflex pointers instead of
+  silently undercounting them.
+
+No migration or configuration change is required.
+
 ## [0.46.6.0] - 2026-08-15
 
 **A busy machine can no longer make the job queue evict its own healthy
