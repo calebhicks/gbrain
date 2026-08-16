@@ -10,6 +10,7 @@ import {
   logTurnContextDeliveryFireAndForget,
   awaitPendingVolunteerEventWrites,
   _resetPendingVolunteerEventWritesForTests,
+  _peekPendingVolunteerEventWritesForTests,
 } from '../src/core/context/volunteer-events.ts';
 import { logDeliveredReflexPointers, type ReflexPointer } from '../src/core/context/retrieval-reflex.ts';
 import type { VolunteeredPage } from '../src/core/context/volunteer.ts';
@@ -109,10 +110,14 @@ describe('logDeliveredReflexPointers — ambient reflex channel', () => {
   test('logs under the reflex channel with the shared rationale template', async () => {
     const captured: CapturedInsert[] = [];
     logDeliveredReflexPointers(stubEngine(captured), [POINTER]);
+    expect(_peekPendingVolunteerEventWritesForTests()).toBe(1);
     await awaitPendingVolunteerEventWrites(2000);
     expect(captured).toHaveLength(1);
     expect(captured[0].params).toContain('reflex');
     expect(captured[0].params).toContain('alias match "Alice"'); // reflexPointerRationale parity
+
+    expect(() => logDeliveredReflexPointers(stubEngine([], true), [POINTER])).not.toThrow();
+    await awaitPendingVolunteerEventWrites(2000);
   });
 });
 

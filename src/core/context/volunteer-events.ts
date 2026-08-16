@@ -20,7 +20,7 @@
 
 import type { BrainEngine } from './../engine.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
-import { reflexPointerRationale } from './retrieval-reflex.ts';
+import type { ReflexPointer } from './retrieval-reflex.ts';
 
 export const VOLUNTEER_EVENTS_TTL_DAYS = 90;
 
@@ -37,6 +37,11 @@ export const DEFAULT_HOOK_CHANNEL: HarnessChannel = 'claude-code';
 
 /** session_id trust-boundary clamp — shared with the volunteer_context op. */
 export const SESSION_ID_MAX_LEN = 256;
+
+/** Canonical deterministic rationale for reflex-channel delivery telemetry. */
+export function reflexPointerRationale(p: ReflexPointer): string {
+  return `${p.arm} match "${p.display}"`;
+}
 
 export function isVolunteerChannel(v: unknown): v is VolunteerChannel {
   return (VOLUNTEER_CHANNELS as readonly string[]).includes(v as string);
@@ -68,7 +73,7 @@ export function logTurnContextDeliveryFireAndForget(
   engine: BrainEngine,
   result: {
     volunteered?: Array<Parameters<typeof volunteerEventRowsFrom>[0][number]>;
-    pointers?: import('./retrieval-reflex.ts').ReflexPointer[];
+    pointers?: ReflexPointer[];
   },
   req: { channel?: string; sessionId?: string },
 ): void {
