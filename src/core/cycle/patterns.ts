@@ -27,6 +27,7 @@ import { MinionQueue } from '../minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, MinionJobStatus, SubagentHandlerData } from '../minions/types.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { truncateUtf8 } from '../text-safe.ts';
 import type { Page, PageType } from '../types.ts';
 // #2415: allow-list + output-root resolution shared with the synthesize
 // phase — both phases must agree on the configured namespace.
@@ -419,7 +420,11 @@ async function gatherReflections(
   return rows.map(r => ({
     slug: r.slug,
     title: r.title ?? r.slug,
-    excerpt: (r.compiled_truth ?? '').slice(0, 600),
+    // A raw UTF-16 slice can split an astral character at the boundary and
+    // leave a lone surrogate. Postgres rejects that when the prompt is bound
+    // into the minion job's JSONB payload. Use the shared safe truncator so a
+    // reflection containing emoji cannot abort the entire patterns phase.
+    excerpt: truncateUtf8(r.compiled_truth ?? '', 600),
   }));
 }
 
@@ -577,6 +582,7 @@ function makeError(cls: string, code: string, message: string, hint?: string): P
 // source-scoping contract (#1586) without driving a whole dream cycle.
 // Mirrors synthesize.ts's `__testing` block.
 export const __testing = {
+  gatherReflections,
   collectChildPutPageSlugs,
   reverseWriteRefs,
 };
