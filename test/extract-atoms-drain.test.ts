@@ -45,7 +45,7 @@ describe('runExtractAtomsDrain (issue #1678)', () => {
 
   it('stops at the wallclock window with remaining > 0', async () => {
     // SYNC stepping clock: now() #1 sets deadline (0+100=100); the while-check
-    // then sees 50, 50 (two batches), then 999999 → past deadline → stop.
+    // and post-batch check see 50, then 999999 → past deadline → stop.
     const times = [0, 50, 50, 999_999];
     let ti = 0;
     const now = () => times[Math.min(ti++, times.length - 1)];
@@ -59,8 +59,81 @@ describe('runExtractAtomsDrain (issue #1678)', () => {
       { windowMs: 100 },
     );
     expect(result.stopped).toBe('window');
-    expect(result.remaining).toBe(5);
-    expect(result.batches).toBe(2);
+    expect(result.remaining).toBeNull();
+    expect(result.batches).toBe(1);
+  });
+
+  it('aborts an in-flight batch when the real wallclock window expires', async () => {
+    const started = Date.now();
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => 5,
+        runBatch: (signal) => new Promise((_, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        }),
+        now: Date.now,
+      },
+      { windowMs: 20 },
+    );
+    expect(result.stopped).toBe('window');
+    expect(result.remaining).toBeNull();
+    expect(result.batches).toBe(0);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it('rejects an external abort after releasing the held lock', async () => {
+    const ac = new AbortController();
+    const events: string[] = [];
+    await expect(runExtractAtomsDrain(
+      {
+        withLock: async (work) => {
+          events.push('acquired');
+          try { return await work(); }
+          finally { events.push('released'); }
+        },
+        countRemaining: async () => 5,
+        runBatch: async () => {
+          ac.abort(new Error('worker shutdown'));
+          throw ac.signal.reason;
+        },
+        now: Date.now,
+      },
+      { windowMs: 1_000, abortSignal: ac.signal },
+    )).rejects.toThrow('worker shutdown');
+    expect(events).toEqual(['acquired', 'released']);
+  });
+
+  it('preserves provider_failure when the same batch crosses the deadline', async () => {
+    const times = [0, 50, 999_999, 999_999];
+    let ti = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => 5,
+        runBatch: async () => ({ extracted: 0, skipped: 0, providerFailure: true }),
+        now: () => times[Math.min(ti++, times.length - 1)],
+      },
+      { windowMs: 100 },
+    );
+    expect(result.status).toBe('provider_failure');
+    expect(result.stopped).toBe('provider_failure');
+  });
+
+  it('keeps a just-observed empty backlog drained even at the deadline', async () => {
+    const times = [0, 50, 999_999];
+    let ti = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: async () => 0,
+        runBatch: async () => ({ extracted: 0, skipped: 0 }),
+        now: () => times[Math.min(ti++, times.length - 1)],
+      },
+      { windowMs: 100 },
+    );
+    expect(result.stopped).toBe('drained');
+    expect(result.remaining).toBe(0);
   });
 
   it('stops on a zero-progress batch (no hot loop)', async () => {
@@ -197,7 +270,7 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
   // not from `r.status` (which collapses partial and total failure into the
   // same 'warn' value — the exact discard the issue reports).
   it('runBatch derives providerFailure from failures.length + zero processed items, not r.status', () => {
-    const runBatchBlock = src.slice(src.indexOf('runBatch: async () => {'));
+    const runBatchBlock = src.slice(src.indexOf('runBatch: async (signal) => {'));
     expect(runBatchBlock).toContain('d.failures');
     expect(runBatchBlock).toContain('transcripts_processed');
     expect(runBatchBlock).toContain('pages_processed');

@@ -87,6 +87,7 @@ const DEFAULT_BUDGET_USD = 0.3;
 // Exported so tests pin the defaults instead of re-hardcoding the literals.
 export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 50_000;
 export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096;
+const BOOKKEEPING_GRACE_MS = 5_000;
 
 /**
  * gbrain#4148: consecutive same-content failures of a content-deterministic
@@ -207,6 +208,8 @@ export interface ExtractAtomsOpts {
    * `heartbeat()` on the passed reporter.
    */
   progress?: ProgressReporter;
+  /** Drain/job deadline propagated to the model call and item loop. */
+  abortSignal?: AbortSignal;
 }
 
 interface ExtractedAtom {
@@ -636,6 +639,7 @@ export async function runPhaseExtractAtoms(
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
+  if (opts.abortSignal?.aborted) throw opts.abortSignal.reason;
 
   // 1a. Get transcripts (test seam OR production discovery).
   //     v0.41.2.1: config loader switched to loadConfigWithEngine() so the
@@ -833,6 +837,7 @@ export async function runPhaseExtractAtoms(
   const failures: Array<{ source: string; error: string }> = [];
   let estimatedSpendUsd = 0;
   let budgetExhausted = false;
+  let deadlineAborted = false;
   // #3813: key-aware tier default, not a hardcoded Anthropic model — an
   // OPENAI_API_KEY-only install must not route to an unservable provider.
   // Pre-computed so a config-read failure inside the try below (caught, see
@@ -1075,7 +1080,11 @@ export async function runPhaseExtractAtoms(
   }
 
   await withBudgetTracker(budgetTracker, async () => {
-  for (const item of work) {
+  workLoop: for (const item of work) {
+    if (opts.abortSignal?.aborted) {
+      deadlineAborted = true;
+      break;
+    }
     await maybeYield();
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1101,6 +1110,7 @@ export async function runPhaseExtractAtoms(
           },
         ],
         maxTokens: maxOutputTokens,
+        abortSignal: opts.abortSignal,
       });
       // Post-await yield: closes the "long LLM call past TTL" hazard
       // codex flagged. The 30s throttle inside maybeYield bounds the
@@ -1112,6 +1122,13 @@ export async function runPhaseExtractAtoms(
       if (pacingMs > 0) await new Promise<void>((r) => setTimeout(r, pacingMs));
 
       estimatedSpendUsd = budgetTracker.totalSpent;
+
+      // A completed call is billable, so capture spend before honoring an
+      // abort that raced with its return. Do not begin writes after deadline.
+      if (opts.abortSignal?.aborted) {
+        deadlineAborted = true;
+        break;
+      }
 
       // gbrain#4148: typed outcome — malformed output is a FAILURE (counted
       // toward the bounded tombstone below), never a zero-yield success.
@@ -1294,6 +1311,14 @@ export async function runPhaseExtractAtoms(
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
         }
+        // One model response describes one source item. Finish importing that
+        // whole response before honoring the deadline: a single atom carrying
+        // source_hash makes the item idempotently complete on rediscovery, so
+        // stopping between its atoms would permanently discard the remainder.
+        if (opts.abortSignal?.aborted) {
+          deadlineAborted = true;
+          break workLoop;
+        }
         // Completion receipt: flip provisional → real in one statement (only
         // after every atom AND provenance edge persisted), then stamp the
         // source page. A crash between flip and stamp degrades to the legacy
@@ -1316,6 +1341,10 @@ export async function runPhaseExtractAtoms(
       // Reporter rate-limits to ~1 line/sec; safe to tick every iter.
       opts.progress?.tick(1, `${totalAtomsExtracted} atoms / ${duplicatesSkipped} skipped`);
     } catch (err) {
+      if (opts.abortSignal?.aborted) {
+        deadlineAborted = true;
+        break;
+      }
       if (err instanceof BudgetExhausted) {
         budgetExhausted = true;
         if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1386,13 +1415,14 @@ export async function runPhaseExtractAtoms(
     // failures.length (which stays inclusive, for CLI/receipt reporting),
     // so a heavy run that only ever hit transient errors doesn't trip the
     // doctor extract_health halt-rate warning.
+    const bookkeepingSignal = AbortSignal.timeout(BOOKKEEPING_GRACE_MS);
     await upsertExtractRollup(engine, {
       kind: 'atoms',
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: hardFailureCount === 0 ? 1 : 0,
+      round_completed_delta: hardFailureCount === 0 && !deadlineAborted ? 1 : 0,
       halt_delta: hardFailureCount > 0 ? 1 : 0,
-    });
+    }, { signal: bookkeepingSignal });
   }
 
   return {
@@ -1434,6 +1464,7 @@ export async function runPhaseExtractAtoms(
       budget_usd: budgetCap,
       model: extractModel,
       budget_exhausted: budgetExhausted,
+      deadline_aborted: deadlineAborted,
       source_id: sourceId,
       dry_run: opts.dryRun ?? false,
     },

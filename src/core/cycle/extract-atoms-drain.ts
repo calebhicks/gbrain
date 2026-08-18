@@ -26,6 +26,7 @@
 import type { BrainEngine } from '../engine.ts';
 import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
 import { redactFindings } from '../secret-scan.ts';
+import { anySignal } from '../abort-check.ts';
 import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
 
 /** #4730: bounded operator-facing failure detail; totals stay exact above the cap. */
@@ -88,7 +89,7 @@ export interface ExtractAtomsDrainDeps {
    * error was dropped and the operator had to re-run the work to see the
    * other reasons.
    */
-  runBatch: () => Promise<{
+  runBatch: (signal: AbortSignal) => Promise<{
     extracted: number;
     skipped: number;
     providerFailure?: boolean;
@@ -109,6 +110,8 @@ export interface ExtractAtomsDrainOpts {
   windowMs: number;
   /** Hard cap on batches (belt-and-suspenders against a 0-progress loop). Default 1000. */
   maxBatches?: number;
+  /** External caller cancellation (worker timeout / shutdown). */
+  abortSignal?: AbortSignal;
 }
 
 export interface ExtractAtomsDrainResult {
@@ -174,9 +177,14 @@ export async function runExtractAtomsDrain(
   deps: ExtractAtomsDrainDeps,
   opts: ExtractAtomsDrainOpts,
 ): Promise<ExtractAtomsDrainResult> {
+  if (opts.abortSignal?.aborted) throw opts.abortSignal.reason;
   const maxBatches = opts.maxBatches ?? 1000;
-  return deps.withLock(async () => {
-    const deadline = deps.now() + opts.windowMs;
+  const deadline = deps.now() + opts.windowMs;
+  const deadlineSignal = anySignal(
+    AbortSignal.timeout(Math.max(1, opts.windowMs)),
+    opts.abortSignal,
+  );
+  const result = await deps.withLock<ExtractAtomsDrainResult>(async () => {
     let extracted = 0;
     let skipped = 0;
     let batches = 0;
@@ -191,13 +199,19 @@ export async function runExtractAtomsDrain(
     const failures: ExtractAtomsDrainFailure[] = [];
     let lastError: string | null = null;
 
-    while (deps.now() < deadline) {
+    while (deps.now() < deadline && !deadlineSignal.aborted) {
       if (batches >= maxBatches) { stopped = 'max_batches'; break; }
 
       const before = await deps.countRemaining();
       if (before === 0) { stopped = 'drained'; break; }
 
-      const r = await deps.runBatch();
+      let r: Awaited<ReturnType<ExtractAtomsDrainDeps['runBatch']>>;
+      try {
+        r = await deps.runBatch(deadlineSignal);
+      } catch (err) {
+        if (deadlineSignal.aborted) break;
+        throw err;
+      }
       extracted += r.extracted;
       skipped += r.skipped;
       batches++;
@@ -254,6 +268,13 @@ export async function runExtractAtomsDrain(
         break;
       }
 
+      // A real provider failure wins over coincident window expiry so the
+      // durable Minion retry path cannot be false-greened as a partial drain.
+      if (deadlineSignal.aborted || deps.now() >= deadline) {
+        stopped = 'window';
+        break;
+      }
+
       // Stop if a batch made zero forward progress — extraction is failing or
       // everything left is ineligible (e.g. all skipped). Prevents a hot loop
       // that spends budget without draining.
@@ -267,7 +288,14 @@ export async function runExtractAtomsDrain(
       }
     }
 
-    const remaining = await deps.countRemaining();
+    // Do not turn a bounded drain into an unbounded final recount after the
+    // window has elapsed. A subsequent dry-run supplies the exact number.
+    const windowElapsed = deadlineSignal.aborted || deps.now() >= deadline;
+    const remaining = stopped === 'drained'
+      ? 0
+      : windowElapsed
+        ? null
+        : await deps.countRemaining();
     // issue #3218 (codex P2): don't let a final remaining===0 recount
     // overwrite 'provider_failure' back to 'drained' — that would report the
     // contradictory {status: 'provider_failure', stopped: 'drained'} and
@@ -289,6 +317,10 @@ export async function runExtractAtomsDrain(
       last_error: lastError,
     };
   });
+  // Internal window expiry is an ordinary partial drain. External worker
+  // cancellation still rejects so the durable job retry path remains intact.
+  if (opts.abortSignal?.aborted) throw opts.abortSignal.reason;
+  return result;
 }
 
 // ─── Shared wiring helper (v0.42.x #1685 DECISION 5A) ──────────────────────
@@ -326,6 +358,8 @@ export interface DrainForSourceOpts {
   maxBatches?: number;
   /** Optional per-batch progress sink (stderr line in dream; job progress in the handler). */
   onBatch?: ExtractAtomsDrainDeps['onBatch'];
+  /** Worker cancellation / shutdown signal. */
+  abortSignal?: AbortSignal;
 }
 
 export async function runExtractAtomsDrainForSource(
@@ -342,11 +376,12 @@ export async function runExtractAtomsDrainForSource(
   return runExtractAtomsDrain(
     {
       withLock: (work) => withRefreshingLock(engine, lockId, work, { ttlMinutes: 5 }),
-      runBatch: async () => {
+      runBatch: async (signal) => {
         const r = await runPhaseExtractAtoms(engine, {
           sourceId: extractionSourceId,
           dryRun: false,
           brainDir: opts.brainDir,
+          abortSignal: signal,
         });
         const d = (r.details ?? {}) as Record<string, unknown>;
         // issue #3218: `r.status` collapses to 'warn' whether ONE item failed
@@ -386,6 +421,10 @@ export async function runExtractAtomsDrainForSource(
       now: Date.now,
       onBatch: opts.onBatch,
     },
-    { windowMs: opts.windowSeconds * 1000, maxBatches: opts.maxBatches },
+    {
+      windowMs: opts.windowSeconds * 1000,
+      maxBatches: opts.maxBatches,
+      abortSignal: opts.abortSignal,
+    },
   );
 }
