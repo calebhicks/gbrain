@@ -14,7 +14,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { resolveSourceId, getDefaultSourcePath, isResolverUserError, SourceTargetError, __testing } from '../src/core/source-resolver.ts';
+import { resolveSourceId, getDefaultSourcePath, isResolverUserError, SourceTargetError, configuredBrainDefaultSourceId, __testing } from '../src/core/source-resolver.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // ── Stub engine ────────────────────────────────────────────
@@ -163,6 +163,23 @@ describe('resolveSourceId priority 5 — sources.default config key', () => {
     const engine = makeStub(['default', 'custom'], [], 'custom');
     const id = await resolveSourceId(engine, null, '/some/random/dir');
     expect(id).toBe('custom');
+  });
+});
+
+describe('configuredBrainDefaultSourceId', () => {
+  test('reads only the configured brain default', async () => {
+    const engine = makeStub(['default', 'brain-main'], [], 'brain-main');
+    await expect(configuredBrainDefaultSourceId(engine)).resolves.toBe('brain-main');
+  });
+
+  test('treats absent or invalid legacy config as unconfigured', async () => {
+    await expect(configuredBrainDefaultSourceId(makeStub(['default'], [], null))).resolves.toBeNull();
+    await expect(configuredBrainDefaultSourceId(makeStub(['default'], [], 'INVALID!'))).resolves.toBeNull();
+  });
+
+  test('fails loud when a configured source is not registered', async () => {
+    const engine = makeStub(['default'], [], 'missing-source');
+    await expect(configuredBrainDefaultSourceId(engine)).rejects.toThrow(/not found/);
   });
 });
 
