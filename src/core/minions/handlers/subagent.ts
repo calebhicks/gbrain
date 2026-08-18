@@ -1383,7 +1383,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       });
       heartbeat('llm_call_completed', { turn_idx: turnIdx, tokens: usage });
     },
-    onToolCallStart: async (turnIdx, messageIdx, ordinal, toolName, input, providerToolCallId) => {
+    onToolCallStart: async (turnIdx, messageIdx, ordinal, toolName, input, providerToolCallId, actualModel) => {
       // CRITICAL — read back the canonical gbrain_tool_use_id from RETURNING,
       // NOT the locally-generated UUID. On crash-replay the (job_id,
       // message_idx, ordinal) row already exists with the ORIGINAL UUID from
@@ -1415,7 +1415,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
          ON CONFLICT (job_id, message_idx, ordinal) DO UPDATE
            SET status = subagent_tool_executions.status
          RETURNING gbrain_tool_use_id::text AS gbrain_tool_use_id`,
-        [ctx.id, messageIdx, providerToolCallId, toolName, JSON.stringify(input ?? null), ordinal, candidateId, recipeIdFromModel(model)],
+        [ctx.id, messageIdx, providerToolCallId, toolName, JSON.stringify(input ?? null), ordinal, candidateId, recipeIdFromModel(actualModel)],
       );
       const gbrainToolUseId = rows[0]?.gbrain_tool_use_id ?? candidateId;
       heartbeat('tool_called', { turn_idx: turnIdx, tool_name: toolName });

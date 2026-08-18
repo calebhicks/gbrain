@@ -452,6 +452,42 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
       .toEqual({ eligible: true, reason: 'timeout' });
   });
 
+  it('falls back after chat normalizes a real transport HTTP 408', async () => {
+    const seenModels: string[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seenModels.push(opts.model ?? 'default');
+      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+        const err = new Error('provider request timeout') as Error & { status: number };
+        err.status = 408;
+        throw err;
+      }
+      return {
+        text: 'recovered from 408',
+        blocks: [{ type: 'text', text: 'recovered from 408' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 2, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-4o',
+        providerId: 'openai',
+      };
+    });
+
+    const result = await toolLoop({
+      model: 'anthropic:claude-sonnet-4-6',
+      fallbackModels: ['openai:gpt-4o'],
+      initialMessages: [{ role: 'user', content: 'hi' }],
+      tools: [],
+      toolHandlers: new Map(),
+    });
+
+    expect(result.finalText).toBe('recovered from 408');
+    expect(seenModels).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-4o']);
+    expect(result.fallbackEvents?.[0]).toMatchObject({
+      failedModel: 'anthropic:claude-sonnet-4-6',
+      fallbackModel: 'openai:gpt-4o',
+      reason: 'timeout',
+    });
+  });
+
   it('does not fall back on ineligible request/config failures', async () => {
     const original = new AIConfigError('bad request', 'fix it');
     let calls = 0;

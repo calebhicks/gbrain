@@ -87,8 +87,16 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
   const msg = anyErr?.message ?? String(err);
   const ctxPrefix = context ? `[${context}] ` : '';
 
-  // 4xx (except 429) = config-level, non-retryable
-  if (typeof status === 'number' && status >= 400 && status < 500 && status !== 429) {
+  // 4xx request/auth failures are configuration-level and non-retryable.
+  // 408 is an upstream/request timeout, like 429 it stays transient so the
+  // bounded tool-loop fallback classifier can switch providers.
+  if (
+    typeof status === 'number'
+    && status >= 400
+    && status < 500
+    && status !== 408
+    && status !== 429
+  ) {
     return carryStatusFields(err, new AIConfigError(
       `${ctxPrefix}${msg}`,
       status === 401 || status === 403

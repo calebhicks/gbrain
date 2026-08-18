@@ -361,14 +361,31 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(result.tokens.out).toBe(12); // 8 + 4
   });
 
-  it('fallback path persists the actual answering model on the assistant turn', async () => {
+  it('fallback path persists the actual model on assistant and tool receipts', async () => {
     const seenModels: string[] = [];
+    let fallbackTurn = 0;
     __setChatTransportForTests(async (opts) => {
       seenModels.push(opts.model ?? 'default');
       if (opts.model === 'anthropic:claude-sonnet-4-6') {
         const err = new Error('rate limit') as Error & { status: number };
         err.status = 429;
         throw err;
+      }
+      fallbackTurn++;
+      if (fallbackTurn === 1) {
+        return {
+          text: '',
+          blocks: [{
+            type: 'tool-call',
+            toolCallId: 'fallback-tool-1',
+            toolName: 'search',
+            input: { q: 'fallback' },
+          }] as ChatBlock[],
+          stopReason: 'tool_calls',
+          usage: { input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'openai:gpt-4o',
+          providerId: 'openai',
+        } satisfies ChatResult;
       }
       return {
         text: 'answered by fallback',
@@ -391,7 +408,12 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     const result = await handler(ctx);
 
     expect(result.result).toBe('answered by fallback');
-    expect(seenModels).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-4o']);
+    expect(seenModels).toEqual([
+      'anthropic:claude-sonnet-4-6',
+      'openai:gpt-4o',
+      'openai:gpt-4o',
+    ]);
+    expect(executions).toHaveLength(1);
     expect(result.fallback_events).toEqual([{
       turnIdx: 0,
       primaryModel: 'anthropic:claude-sonnet-4-6',
@@ -404,7 +426,12 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
       `SELECT model FROM subagent_messages WHERE job_id = $1 AND role = 'assistant' ORDER BY message_idx`,
       [jobId],
     );
-    expect(rows.map(r => r.model)).toEqual(['openai:gpt-4o']);
+    expect(rows.map(r => r.model)).toEqual(['openai:gpt-4o', 'openai:gpt-4o']);
+    const toolRows = await engine.executeRaw<{ provider_id: string | null }>(
+      `SELECT provider_id FROM subagent_tool_executions WHERE job_id = $1`,
+      [jobId],
+    );
+    expect(toolRows).toEqual([{ provider_id: 'openai' }]);
   });
 
   it('#4155 regression: two different tool calls sharing the SAME provider id persist as two rows with the raw id intact', async () => {

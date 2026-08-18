@@ -4250,6 +4250,7 @@ export interface ToolLoopOpts {
     toolName: string,
     input: unknown,
     providerToolCallId: string,
+    model: string,
   ) => Promise<{ gbrainToolUseId: string }>;
   onToolCallComplete?: (gbrainToolUseId: string, output: unknown) => Promise<void>;
   onToolCallFailed?: (gbrainToolUseId: string, error: string) => Promise<void>;
@@ -4515,6 +4516,8 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
   let messageIdx = opts.replayState?.nextMessageIdx ?? 0;
   let finalText = '';
   let stopReason: ToolLoopStopReason = 'end';
+  // A successful fallback remains active for later tool turns.
+  let activeModel = opts.model;
 
   while (turnIdx < maxTurns) {
     if (opts.abortSignal?.aborted) {
@@ -4545,7 +4548,7 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
     let chatResult: ChatResult;
     try {
       const chatArgs = {
-        model: opts.model,
+        model: activeModel,
         system: opts.system,
         messages,
         tools: opts.tools,
@@ -4568,6 +4571,7 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
     } finally {
       if (releaseTurnPermit) await Promise.resolve(releaseTurnPermit()).catch(() => { /* best-effort */ });
     }
+    activeModel = chatResult.model;
 
     totalUsage.input_tokens += chatResult.usage.input_tokens;
     totalUsage.output_tokens += chatResult.usage.output_tokens;
@@ -4652,6 +4656,7 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
         call.toolName,
         call.input,
         call.toolCallId,
+        chatResult.model,
       )) ?? { gbrainToolUseId: `inline-${turnIdx}-${callIdx}` };
 
       // Replay short-circuit: prior outcome wins, idempotent re-execute allowed.
