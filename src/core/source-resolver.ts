@@ -77,6 +77,22 @@ function readDotfileWalk(startDir: string): string | null {
 }
 
 /**
+ * Return the explicitly configured brain-default source, independent of cwd,
+ * environment, dotfiles, and sole-source convenience routing. Invalid legacy
+ * values are treated as absent. Direct resolver callers fail loud for a valid
+ * but unregistered value; extract-atoms corpus discovery keeps its existing
+ * phase-level fail-open boundary and no-ops that discovery on resolver errors.
+ */
+export async function configuredBrainDefaultSourceId(
+  engine: BrainEngine,
+): Promise<string | null> {
+  const configured = await engine.getConfig('sources.default');
+  if (!configured || !isValidSourceId(configured)) return null;
+  await assertSourceExists(engine, configured);
+  return configured;
+}
+
+/**
  * Resolve the source id for a CLI command.
  *
  * @param engine  Connected brain engine (for sources table lookups).
@@ -196,11 +212,8 @@ export async function resolveSourceId(
   // Silent-fallback tier per codex P1-F: an invalid `sources.default` config
   // value (operator hand-edit gone wrong, legacy underscore id) falls through
   // to tier 6 rather than throwing. Resolver stays robust to bad config.
-  const globalDefault = await engine.getConfig('sources.default');
-  if (globalDefault && isValidSourceId(globalDefault)) {
-    await assertSourceExists(engine, globalDefault);
-    return globalDefault;
-  }
+  const globalDefault = await configuredBrainDefaultSourceId(engine);
+  if (globalDefault) return globalDefault;
 
   // 5.5. Single-non-default-source convenience (v0.41.13, #1434).
   //      When NO brain_default is set AND exactly one registered source has
@@ -805,9 +818,8 @@ export async function resolveSourceWithTier(
   }
 
   // 5. Brain-level default. Silent-fallback (P1-F) like tier 5 in resolveSourceId.
-  const globalDefault = await engine.getConfig('sources.default');
-  if (globalDefault && isValidSourceId(globalDefault)) {
-    await assertSourceExists(engine, globalDefault);
+  const globalDefault = await configuredBrainDefaultSourceId(engine);
+  if (globalDefault) {
     return { source_id: globalDefault, tier: 'brain_default', detail: 'sources.default config' };
   }
 

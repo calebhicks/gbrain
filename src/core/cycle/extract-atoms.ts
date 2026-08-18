@@ -78,6 +78,7 @@ import { resolveTierDefault } from '../model-config.ts';
 import { isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
+import { configuredBrainDefaultSourceId } from '../source-resolver.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -642,33 +643,38 @@ export async function runPhaseExtractAtoms(
   let transcripts: Array<{ filePath: string; content: string; contentHash: string }> = opts._transcripts ?? [];
   // Configured transcript corpus paths are brain-global, so only default discovers them.
   if (
-    sourceId === 'default'
-    && transcripts.length === 0
+    transcripts.length === 0
     && opts.brainDir !== undefined
     && opts._transcripts === undefined
   ) {
     try {
-      const { discoverTranscripts } = await import('./transcript-discovery.ts');
-      const { loadConfigWithEngine } = await import('../config.ts');
-      const cfgRaw = opts._loadConfig
-        ? await opts._loadConfig()
-        : await loadConfigWithEngine(engine);
-      const cfg = (cfgRaw ?? {}) as unknown as Record<string, unknown>;
-      const dream = cfg.dream as
-        | { synthesize?: { session_corpus_dir?: string; meeting_transcripts_dir?: string } }
-        | undefined;
-      const corpusDir = dream?.synthesize?.session_corpus_dir;
-      const meetingDir = dream?.synthesize?.meeting_transcripts_dir;
-      if (corpusDir !== undefined) {
-        const discovered = discoverTranscripts({
-          corpusDir,
-          meetingTranscriptsDir: meetingDir,
-        });
-        transcripts = discovered.map((d) => ({
-          filePath: d.filePath,
-          content: d.content,
-          contentHash: d.contentHash,
-        }));
+      // The session corpus is brain-global, while atom idempotency and writes
+      // are source-scoped. Only the configured brain-default source (or the
+      // seeded default when none is configured) may discover it.
+      const corpusSourceId = (await configuredBrainDefaultSourceId(engine)) ?? 'default';
+      if (sourceId === corpusSourceId) {
+        const { discoverTranscripts } = await import('./transcript-discovery.ts');
+        const { loadConfigWithEngine } = await import('../config.ts');
+        const cfgRaw = opts._loadConfig
+          ? await opts._loadConfig()
+          : await loadConfigWithEngine(engine);
+        const cfg = (cfgRaw ?? {}) as unknown as Record<string, unknown>;
+        const dream = cfg.dream as
+          | { synthesize?: { session_corpus_dir?: string; meeting_transcripts_dir?: string } }
+          | undefined;
+        const corpusDir = dream?.synthesize?.session_corpus_dir;
+        const meetingDir = dream?.synthesize?.meeting_transcripts_dir;
+        if (corpusDir !== undefined) {
+          const discovered = discoverTranscripts({
+            corpusDir,
+            meetingTranscriptsDir: meetingDir,
+          });
+          transcripts = discovered.map((d) => ({
+            filePath: d.filePath,
+            content: d.content,
+            contentHash: d.contentHash,
+          }));
+        }
       }
     } catch {
       // No transcripts available — phase no-ops cleanly.
