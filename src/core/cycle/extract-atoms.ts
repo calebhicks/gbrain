@@ -1311,14 +1311,6 @@ export async function runPhaseExtractAtoms(
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
         }
-        // One model response describes one source item. Finish importing that
-        // whole response before honoring the deadline: a single atom carrying
-        // source_hash makes the item idempotently complete on rediscovery, so
-        // stopping between its atoms would permanently discard the remainder.
-        if (opts.abortSignal?.aborted) {
-          deadlineAborted = true;
-          break workLoop;
-        }
         // Completion receipt: flip provisional → real in one statement (only
         // after every atom AND provenance edge persisted), then stamp the
         // source page. A crash between flip and stamp degrades to the legacy
@@ -1340,6 +1332,14 @@ export async function runPhaseExtractAtoms(
       // v0.41.19.0 (T4): one tick per processed item, with a count note.
       // Reporter rate-limits to ~1 line/sec; safe to tick every iter.
       opts.progress?.tick(1, `${totalAtomsExtracted} atoms / ${duplicatesSkipped} skipped`);
+      // One model response describes one source item. Finish the item
+      // completely — imports, completion receipt, scan stamp, counters —
+      // before honoring the deadline, so an aborted run never strands a
+      // receipted-but-partial item (review finding, 2026-08-18).
+      if (opts.abortSignal?.aborted) {
+        deadlineAborted = true;
+        break workLoop;
+      }
     } catch (err) {
       if (opts.abortSignal?.aborted) {
         deadlineAborted = true;
