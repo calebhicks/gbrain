@@ -31,6 +31,7 @@ describe('skillopt rollout tool schemas preserve ParamDef metadata', () => {
           totalUsage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
           stopReason: 'end',
           messages: [{ role: 'assistant', content: [{ type: 'text', text: 'done' }] }],
+          fallbackEvents: [],
         };
       },
     });

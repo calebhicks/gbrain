@@ -42,6 +42,11 @@ import { loadAllowedSlugPrefixes, loadOutputRoot, runSubagentsInline } from './s
 import { probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { throwIfAborted } from '../abort-check.ts';
+import {
+  DREAM_PATTERNS_FALLBACKS_CONFIG_KEY,
+  ModelFallbackConfigError,
+  resolveModelFallbackConfig,
+} from '../model-config.ts';
 
 export interface PatternsPhaseOpts {
   brainDir: string;
@@ -225,6 +230,7 @@ export async function runPhasePatterns(
     const data: SubagentHandlerData = {
       prompt: buildPatternsPrompt(reflections, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix),
       model: config.model,
+      fallback_models: config.fallbackModels,
       max_turns: 30,
       // #4217/CDX-12: a patterns child whose every put_page failed must
       // dead-letter (its whole purpose is writing pattern pages), not report
@@ -358,6 +364,14 @@ export async function runPhasePatterns(
 
     return ok(`${writtenRefs.length} pattern page(s) written/updated (${outcome})`, details);
   } catch (e) {
+    if (e instanceof ModelFallbackConfigError) {
+      return failed(makeError(
+        'ConfigError',
+        'DREAM_MODEL_FALLBACK_CONFIG_INVALID',
+        e.message,
+        `Set ${e.key} to a JSON array of provider:model strings, e.g. ["openai:gpt-5"].`,
+      ));
+    }
     return failed(makeError('InternalError', 'PATTERNS_PHASE_FAIL',
       e instanceof Error ? (e.message || 'patterns phase threw') : String(e)));
   } finally {
@@ -390,6 +404,7 @@ interface PatternsConfig {
   lookbackDays: number;
   minEvidence: number;
   model: string;
+  fallbackModels: string[];
   /** #2415: shared output namespace (dream.synthesize.output_root, default 'wiki'). */
   outputRoot: string;
   /**
@@ -444,12 +459,14 @@ async function loadPatternsConfig(engine: BrainEngine): Promise<PatternsConfig> 
     tier: 'reasoning',
     fallback: 'sonnet',
   });
+  const fallbackModels = await resolveModelFallbackConfig(engine, DREAM_PATTERNS_FALLBACKS_CONFIG_KEY);
   const outputRoot = await loadOutputRoot(engine);
   return {
     enabled,
     lookbackDays: lookbackStr ? Math.max(1, parseInt(lookbackStr, 10) || 30) : 30,
     minEvidence: minEvidenceStr ? Math.max(1, parseInt(minEvidenceStr, 10) || 3) : 3,
     model,
+    fallbackModels,
     outputRoot,
     sourceSlugPrefix: await getSlugPrefixConfig(
       engine, 'dream.patterns.source_slug_prefix', `${outputRoot}/personal/reflections`,

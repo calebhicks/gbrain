@@ -166,9 +166,11 @@ export interface GBrainConfig {
    */
   chat_model?: string;
   /**
-   * Optional silent-refusal fallback chain for `chatWithFallback()` (v0.27+).
+   * Optional reserved silent-refusal fallback chain for chat-only callers.
    * Each entry is a "provider:modelId" string. Blocked from critic/judge/
    * synthesize flows in their respective handlers (per D13 review decision).
+   * Gateway-native subagent infrastructure fallback is configured per job via
+   * `SubagentHandlerData.fallback_models`, not this global chain.
    */
   chat_fallback_chain?: string[];
   /** Optional base URL overrides for openai-compatible providers (keyed by recipe id). */
@@ -1359,6 +1361,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.tier.subagent',
   'models.aliases',
   'models.dream.synthesize',
+  'models.dream.synthesize_fallbacks',
   'models.dream.extract_atoms',
   'cycle.extract_atoms.budget_usd',
   'cycle.extract_atoms.max_source_chars',
@@ -1370,6 +1373,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'cycle.extract_atoms.max_output_tokens',
   'cycle.extract_atoms.pacing_ms',
   'models.dream.patterns',
+  'models.dream.patterns_fallbacks',
   'models.dream.synthesize_verdict',
   // #4152: preferred triage-model key (explicit pre-read in loadSynthConfig;
   // wins over models.dream.synthesize_verdict + dream.synthesize.verdict_model).
