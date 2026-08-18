@@ -203,8 +203,11 @@ export const BUILT_IN_JUNK_PATTERNS: ReadonlyArray<JunkPattern> = Object.freeze(
   // Generic 403 / blocked-access pages.
   {
     name: 'access_denied',
+    // Keep the permissive body match for WAF pages with trailing detail.
+    // Titles use the anchored error_page_title matcher below so substantive
+    // titles such as "Access Denied? Digital Access..." are not quarantined.
     pattern: /^\s*access denied\b/im,
-    applies_to: 'both',
+    applies_to: 'body',
   },
   // CAPTCHA gates.
   {
@@ -225,7 +228,7 @@ export const BUILT_IN_JUNK_PATTERNS: ReadonlyArray<JunkPattern> = Object.freeze(
   // motivating this change (202+ from straylight-brain).
   {
     name: 'error_page_title',
-    pattern: /^(403|404|500|502|503|error \d{3}|page not found|forbidden|access denied|service unavailable|robot check|verify you are human)\s*$/i,
+    pattern: /^(403|404|500|502|503|error \d{3}|page not found|forbidden|access denied[.!]?|service unavailable|robot check|verify you are human)\s*$/i,
     applies_to: 'title',
   },
   // Cloudflare challenge title (companion to the body-scoped
