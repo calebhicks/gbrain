@@ -3,6 +3,7 @@ import {
   toolLoop,
   classifyToolLoopFallbackFailure,
   __setChatTransportForTests,
+  __setGenerateTextTransportForTests,
   configureGateway,
   resetGateway,
   type ChatBlock,
@@ -23,6 +24,7 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
   });
   afterEach(() => {
     __setChatTransportForTests(null);
+    __setGenerateTextTransportForTests(null);
     resetGateway();
   });
 
@@ -452,23 +454,20 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
       .toEqual({ eligible: true, reason: 'timeout' });
   });
 
-  it('falls back after chat normalizes a real transport HTTP 408', async () => {
-    const seenModels: string[] = [];
-    __setChatTransportForTests(async (opts) => {
-      seenModels.push(opts.model ?? 'default');
-      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+  it('falls back after the real chat path normalizes transport HTTP 408', async () => {
+    let calls = 0;
+    __setGenerateTextTransportForTests(async () => {
+      calls++;
+      if (calls === 1) {
         const err = new Error('provider request timeout') as Error & { status: number };
         err.status = 408;
         throw err;
       }
       return {
-        text: 'recovered from 408',
-        blocks: [{ type: 'text', text: 'recovered from 408' }] as ChatBlock[],
-        stopReason: 'end',
-        usage: { input_tokens: 2, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
-        model: 'openai:gpt-4o',
-        providerId: 'openai',
-      };
+        content: [{ type: 'text', text: 'recovered from 408' }],
+        finishReason: 'stop',
+        usage: { inputTokens: 2, outputTokens: 2 },
+      } as any;
     });
 
     const result = await toolLoop({
@@ -480,7 +479,7 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     });
 
     expect(result.finalText).toBe('recovered from 408');
-    expect(seenModels).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-4o']);
+    expect(calls).toBe(2);
     expect(result.fallbackEvents?.[0]).toMatchObject({
       failedModel: 'anthropic:claude-sonnet-4-6',
       fallbackModel: 'openai:gpt-4o',
