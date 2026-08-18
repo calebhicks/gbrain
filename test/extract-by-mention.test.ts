@@ -259,31 +259,50 @@ describe('gbrain extract links --by-mention — integration', () => {
     });
     // Scope walk to team-b only.
     await runCli(['links', '--by-mention', '--source', 'db', '--source-id', 'team-b']);
-    // team-b post mentions Acme — but cross-source guard suppresses (Acme is in 'default').
+    // LOCAL PATCH (mc-agents 2026-08-15): the by-mention DB pass now admits
+    // brain-default-source targets, so the team-b post's mention of Acme
+    // (default source) LINKS. The walk scoping is what this test asserts:
+    // the default-source post is NOT scanned, so exactly one from-page.
     const rows = await engine.executeRaw<{ c: string; fp: string }>(
       `SELECT COUNT(*)::text AS c, fp.slug AS fp FROM links l
        JOIN pages fp ON fp.id = l.from_page_id
        WHERE l.link_source = 'mentions' GROUP BY fp.slug`, [],
     );
-    // Default-source post NOT scanned (walk scoped to team-b); team-b post
-    // scanned but cross-source guard fires → zero mention rows.
-    expect(rows.length).toBe(0);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.fp).toBe('writing/team-b-post');
   });
 
-  test('9. cross-source mention suppressed (source isolation)', async () => {
+  test('9. cross-source mentions: default-source targets link, others stay suppressed (LOCAL PATCH)', async () => {
     await seedEntities(); // entities in 'default'
     await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('team-b', 'Team B') ON CONFLICT (id) DO NOTHING`, []);
+    await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('team-c', 'Team C') ON CONFLICT (id) DO NOTHING`, []);
     await engine.putPage('writing/team-b-post', {
       type: 'note', title: 'Team B Post', compiled_truth: 'Acme Corp mentioned.', timeline: '', frontmatter: {},
     }, { sourceId: 'team-b' });
-    // Run without --source-id (walks all) — team-b post mentions default-source Acme.
+    // A non-default entity: mentions of it from OTHER sources must still be
+    // suppressed (the allowance names the brain default source only).
+    await engine.putPage('people/team-c-carol', {
+      type: 'person', title: 'Carol Chen', compiled_truth: 'Carol.', timeline: '', frontmatter: {},
+    }, { sourceId: 'team-c' });
+    await engine.putPage('writing/team-b-post-2', {
+      type: 'note', title: 'Team B Post 2', compiled_truth: 'Met Carol Chen today.', timeline: '', frontmatter: {},
+    }, { sourceId: 'team-b' });
     await runCli(['links', '--by-mention', '--source', 'db']);
-    const rows = await engine.executeRaw<{ c: string }>(
+    const toDefault = await engine.executeRaw<{ c: string }>(
       `SELECT COUNT(*)::text AS c FROM links l
        JOIN pages fp ON fp.id = l.from_page_id
        WHERE fp.slug = 'writing/team-b-post' AND l.link_source = 'mentions'`, [],
     );
-    // Cross-source guard fires → 0 mention links from team-b/post to default/acme.
-    expect(Number(rows[0]!.c)).toBe(0);
+    // LOCAL PATCH: default-source Acme now links from team-b.
+    expect(Number(toDefault[0]!.c)).toBe(1);
+    const toTeamC = await engine.executeRaw<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM links l
+       JOIN pages fp ON fp.id = l.from_page_id
+       JOIN pages tp ON tp.id = l.to_page_id
+       WHERE fp.slug = 'writing/team-b-post-2' AND tp.slug = 'people/team-c-carol'
+         AND l.link_source = 'mentions'`, [],
+    );
+    // Non-default cross-source target: still suppressed.
+    expect(Number(toTeamC[0]!.c)).toBe(0);
   });
 });

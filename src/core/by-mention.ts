@@ -114,6 +114,16 @@ export interface FindMentionsOpts {
    * same-source-only posture.
    */
   allowCrossSource?: boolean;
+  /**
+   * LOCAL PATCH (mc-agents 2026-08-15): target source ids the cross-source
+   * guard additionally admits. The v1 guard suppressed every cross-source
+   * mention, which leaves any source whose upstream emits no wikilinks of its
+   * own (an export, a scrape) with zero graph edges no matter how many known
+   * entities it names — entity pages live in the brain default source.
+   * Callers opt in (the by-mention DB pass passes the brain default);
+   * omitting the field preserves upstream v1 behavior exactly.
+   */
+  allowedTargetSources?: Set<string>;
 }
 
 // ============================================================
@@ -621,7 +631,11 @@ export function findMentionedEntities(
       i += matchedTokens;
       continue;
     }
-    if (!opts.allowCrossSource && matched.source_id !== opts.fromSourceId) {
+    if (
+      matched.source_id !== opts.fromSourceId
+      && !opts.allowCrossSource
+      && !opts.allowedTargetSources?.has(matched.source_id)
+    ) {
       i += matchedTokens;
       continue;
     }
