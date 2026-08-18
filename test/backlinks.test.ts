@@ -48,6 +48,16 @@ describe('extractPageTitle', () => {
     expect(extractPageTitle('---\ntitle: "Jane Doe"\ntype: person\n---\n# Jane')).toBe('Jane Doe');
   });
 
+  test('parses folded and literal YAML title scalars', () => {
+    expect(extractPageTitle('---\ntitle: >-\n  Quarterly planning\n  review\n---\nBody')).toBe('Quarterly planning review');
+    expect(extractPageTitle('---\ntitle: |-\n  Quarterly planning\n  review\n---\nBody')).toBe('Quarterly planning\nreview');
+  });
+
+  test('coerces non-string YAML title scalars through the canonical parser', () => {
+    expect(extractPageTitle('---\ntitle: 2026-08-16\n---\nBody')).toBe('2026-08-16');
+    expect(extractPageTitle('---\ntitle: 1458\n---\nBody')).toBe('1458');
+  });
+
   test('extracts from H1 when no frontmatter title', () => {
     expect(extractPageTitle('---\ntype: person\n---\n# Jane Doe')).toBe('Jane Doe');
   });
