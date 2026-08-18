@@ -178,6 +178,42 @@ describe('assessContentSanity — built-in junk patterns', () => {
     expect(r.junk_pattern_matches).toContain('access_denied');
   });
 
+  test('access_denied preserves WAF body lines with trailing detail', () => {
+    const r = assessContentSanity({
+      compiled_truth: 'Access denied: you do not have permission to access this resource.',
+      timeline: '',
+      title: '',
+    });
+    expect(r.junk_pattern_matches).toContain('access_denied');
+    expect(r.shouldHardBlock).toBe(true);
+  });
+
+  test('access_denied body scope includes timeline content', () => {
+    const r = assessContentSanity({
+      compiled_truth: '',
+      timeline: 'Access denied by the website firewall.',
+      title: '',
+    });
+    expect(r.junk_pattern_matches).toContain('access_denied');
+    expect(r.shouldHardBlock).toBe(true);
+  });
+
+  test.each(['Access Denied', 'Access Denied.', 'Access Denied!'])('bare junk title %j remains blocked', (title) => {
+    const r = assessContentSanity({ compiled_truth: '', timeline: '', title });
+    expect(r.junk_pattern_matches).toContain('error_page_title');
+    expect(r.shouldHardBlock).toBe(true);
+  });
+
+  test('access_denied does not quarantine a substantive title beginning with the phrase', () => {
+    const r = assessContentSanity({
+      compiled_truth: 'A substantive discussion of digital access and inclusion.',
+      timeline: '',
+      title: 'Access Denied? Digital Access: The Right Thing, the Smart Thing, and the Required Thing to Do.',
+    });
+    expect(r.junk_pattern_matches).toEqual([]);
+    expect(r.shouldHardBlock).toBe(false);
+  });
+
   test('captcha_required catches multiple verification phrasings', () => {
     for (const phrase of ['verify you are human', 'verify you are a human', 'captcha required', 'please complete the security check']) {
       const r = assessContentSanity({
