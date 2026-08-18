@@ -2965,7 +2965,7 @@ export async function registerBuiltinHandlers(
       const result = await runExtractAtomsDrainForSource(engine, {
         sourceId,
         windowSeconds,
-        brainDir: repoPath,
+        brainDir: repoPath, abortSignal: job.signal,
       });
       // issue #3218: every item the drain attempted failed (0 succeeded, >=1
       // provider error) — completing this job normally would mark the

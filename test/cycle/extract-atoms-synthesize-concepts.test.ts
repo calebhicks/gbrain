@@ -203,6 +203,24 @@ describe('v0.41 T5: runPhaseExtractAtoms via stubbed chat', () => {
     expect((result.details?.failures as unknown[]).length).toBe(2);
   });
 
+  test('deadline abort stops the in-flight model call without recording a provider failure', async () => {
+    const ac = new AbortController();
+    const chat = async (opts: ChatOpts): Promise<never> => {
+      expect(opts.abortSignal).toBe(ac.signal);
+      ac.abort(new Error('drain deadline'));
+      throw ac.signal.reason;
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath: '/deadline.txt', content: 'c', contentHash: 'deadline-hash' }],
+      _pages: [],
+      _chat: chat as typeof import('../../src/core/ai/gateway.ts').chat,
+      abortSignal: ac.signal,
+    });
+    expect(result.details?.deadline_aborted).toBe(true);
+    expect(result.details?.transcripts_processed).toBe(0);
+    expect(result.details?.failures).toEqual([]);
+  });
+
   // v0.41.2.1 regression case (D9 #14 wording): with _pages:[] and same
   // _transcripts, all PRE-EXISTING PhaseResult.details fields match
   // pre-fix values byte-for-byte. The new fields (pages_processed,

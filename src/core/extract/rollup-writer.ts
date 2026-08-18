@@ -101,6 +101,7 @@ function today(): string {
 export async function upsertExtractRollup(
   engine: BrainEngine,
   input: RollupUpsertInput,
+  opts?: { signal?: AbortSignal },
 ): Promise<{ ok: boolean; error?: string }> {
   const day = input.day ?? today();
   const cost = input.cost_delta ?? 0;
@@ -129,6 +130,7 @@ export async function upsertExtractRollup(
          rollup_write_failures  = extract_rollup_7d.rollup_write_failures  + EXCLUDED.rollup_write_failures,
          updated_at             = now()`,
       [input.kind, input.source_id, day, cost, halts, evalFails, evalPasses, completed, expectedLimits, failures],
+      opts,
     );
     return { ok: true };
   } catch (err) {
