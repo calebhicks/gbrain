@@ -2278,6 +2278,18 @@ async function extractMentionsFromDb(
   // Build gazetteer once per run. Skip everything if there are no
   // linkable entities — vacuous truth, no mentions to find.
   const gazetteer = await buildGazetteer(engine);
+  // LOCAL PATCH (mc-agents 2026-08-15): entity pages live in the brain
+  // default source, so the v1 cross-source suppression left wikilink-free
+  // sources (exports, scrapes) with zero mention edges — measured 0 links
+  // from 4,005 pages naming hundreds of known entities. This pass now admits
+  // default-source targets; NER and meeting-timeline keep the v1 posture.
+  let mentionTargetSources: Set<string> | undefined;
+  try {
+    const brainDefault = (await engine.getConfig('sources.default')) ?? 'default';
+    mentionTargetSources = new Set([brainDefault]);
+  } catch {
+    mentionTargetSources = new Set(['default']);
+  }
   if (gazetteer.size === 0) {
     if (jsonMode) {
       process.stdout.write(JSON.stringify({ event: 'no_gazetteer', message: 'no linkable entity pages found; nothing to scan' }) + '\n');
@@ -2412,6 +2424,7 @@ async function extractMentionsFromDb(
           fromSlug: slug,
           fromSourceId: source_id,
           allowCrossSource,
+          allowedTargetSources: mentionTargetSources,
         })
       : [];
 
