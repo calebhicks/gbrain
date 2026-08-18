@@ -71,6 +71,7 @@ function clearGateway(): void {
 interface FakeJobOpts {
   prompt: string;
   model?: string;
+  fallback_models?: string[];
   allowed_tools?: string[];
   mode?: string;
 }
@@ -81,7 +82,7 @@ async function makeFakeJob(opts: FakeJobOpts): Promise<{ jobId: number; ctx: Min
     `INSERT INTO minion_jobs (submission_authority, name, status, data, queue, priority, created_at)
      VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'active', $1::jsonb, 'default', 0, now())
      RETURNING id`,
-    [JSON.stringify({ prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools, mode: opts.mode })],
+    [JSON.stringify({ prompt: opts.prompt, model: opts.model, fallback_models: opts.fallback_models, allowed_tools: opts.allowed_tools, mode: opts.mode })],
   );
   const jobId = rows[0].id;
 
@@ -92,7 +93,7 @@ async function makeFakeJob(opts: FakeJobOpts): Promise<{ jobId: number; ctx: Min
   const ctx: MinionJobContext = {
     id: jobId,
     name: 'subagent',
-    data: { prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools, mode: opts.mode },
+    data: { prompt: opts.prompt, model: opts.model, fallback_models: opts.fallback_models, allowed_tools: opts.allowed_tools, mode: opts.mode },
     attempts_made: 0,
     signal: abortCtrl.signal,
     deadlineAtMs: null,
@@ -358,6 +359,52 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     // Token accumulation across both turns.
     expect(result.tokens.in).toBe(45); // 20 + 25
     expect(result.tokens.out).toBe(12); // 8 + 4
+  });
+
+  it('fallback path persists the actual answering model on the assistant turn', async () => {
+    const seenModels: string[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seenModels.push(opts.model ?? 'default');
+      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+        const err = new Error('rate limit') as Error & { status: number };
+        err.status = 429;
+        throw err;
+      }
+      return {
+        text: 'answered by fallback',
+        blocks: [{ type: 'text', text: 'answered by fallback' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-4o',
+        providerId: 'openai',
+      } satisfies ChatResult;
+    });
+
+    const executions: Array<{ name: string; input: unknown; ts: number }> = [];
+    const handler = buildHandler(makeStubTools(executions));
+    const { jobId, ctx } = await makeFakeJob({
+      prompt: 'hello',
+      model: 'anthropic:claude-sonnet-4-6',
+      fallback_models: ['openai:gpt-4o'],
+    });
+
+    const result = await handler(ctx);
+
+    expect(result.result).toBe('answered by fallback');
+    expect(seenModels).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-4o']);
+    expect(result.fallback_events).toEqual([{
+      turnIdx: 0,
+      primaryModel: 'anthropic:claude-sonnet-4-6',
+      failedModel: 'anthropic:claude-sonnet-4-6',
+      fallbackModel: 'openai:gpt-4o',
+      reason: 'rate_limit',
+      error: 'rate limit',
+    }]);
+    const rows = await engine.executeRaw<{ model: string | null }>(
+      `SELECT model FROM subagent_messages WHERE job_id = $1 AND role = 'assistant' ORDER BY message_idx`,
+      [jobId],
+    );
+    expect(rows.map(r => r.model)).toEqual(['openai:gpt-4o']);
   });
 
   it('#4155 regression: two different tool calls sharing the SAME provider id persist as two rows with the raw id intact', async () => {

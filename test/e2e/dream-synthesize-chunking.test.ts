@@ -362,6 +362,75 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
 });
 
 describe('E2E synthesize chunking — fan-out shape', () => {
+  test('models.dream.synthesize_fallbacks flows to every submitted child job in order', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      await rig.engine.setConfig(
+        'models.dream.synthesize_fallbacks',
+        JSON.stringify(['openai:gpt-5', 'google:gemini-3-pro']),
+      );
+
+      const name = '2026-05-08-fallbacks.txt';
+      const filePath = corpusPath(rig.corpusDir, name);
+      const content = 'fallback model wiring transcript\n'.repeat(200);
+      writeFileSync(filePath, content);
+      await seedVerdict(rig.engine, filePath, content);
+
+      await withoutAnthropicKey(async () => {
+        await withSubagentAutoCancel(rig.engine, async () => {
+          const result = await runPhaseSynthesize(rig.engine, {
+            brainDir: rig.brainDir,
+            dryRun: false,
+          });
+          const details = result.details as { children_submitted: number };
+          expect(details.children_submitted).toBe(1);
+        });
+      });
+
+      const rows = await rig.engine.executeRaw<{ data: string }>(
+        `SELECT data::text AS data FROM minion_jobs WHERE name = 'subagent' ORDER BY id`,
+      );
+      expect(rows).toHaveLength(1);
+      const data = JSON.parse(rows[0]!.data) as { fallback_models?: string[] };
+      expect(data.fallback_models).toEqual(['openai:gpt-5', 'google:gemini-3-pro']);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('malformed models.dream.synthesize_fallbacks fails before child fan-out', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      await rig.engine.setConfig('models.dream.synthesize_fallbacks', '["openai:gpt-5", 7]');
+
+      const name = '2026-05-08-bad-fallbacks.txt';
+      const filePath = corpusPath(rig.corpusDir, name);
+      const content = 'bad fallback config transcript\n'.repeat(200);
+      writeFileSync(filePath, content);
+      await seedVerdict(rig.engine, filePath, content);
+
+      const result = await runPhaseSynthesize(rig.engine, {
+        brainDir: rig.brainDir,
+        dryRun: false,
+      });
+
+      expect(result.status).toBe('fail');
+      expect(result.error?.message).toContain('models.dream.synthesize_fallbacks');
+      expect(result.error?.message).toContain('entry 1 must be a string');
+
+      const rows = await rig.engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM minion_jobs WHERE name = 'subagent'`,
+      );
+      expect(rows[0]!.count).toBe('0');
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
   test('single-chunk transcript key excludes the corpus root', async () => {
     const rig = await setupRig();
     try {

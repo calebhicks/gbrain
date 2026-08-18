@@ -1297,6 +1297,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   const result = await runLoopConvertingLeaseLoss(
     () => gatewayToolLoop({
     model,
+    fallbackModels: data.fallback_models,
     system: systemPrompt,
     initialMessages,
     tools: chatTools,
@@ -1487,6 +1488,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       cache_read: result.totalUsage.cache_read_tokens,
       cache_create: result.totalUsage.cache_creation_tokens,
     },
+    ...(result.fallbackEvents !== undefined ? { fallback_events: result.fallbackEvents } : {}),
   };
 }
 

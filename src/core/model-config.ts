@@ -20,6 +20,7 @@
  * AND lose to new-key config when both are set.
  */
 
+import type { BrainEngine } from './engine.ts';
 import type { ConfigReader } from './config-snapshot.ts';
 import { openrouterModelSupportsSubagentLoop } from './ai/openrouter-families.ts';
 import { splitProviderModelId } from './model-id.ts';
@@ -94,6 +95,63 @@ export const TIER_DEFAULTS: Record<ModelTier, string> = {
   deep:      'anthropic:claude-opus-4-7',
   subagent:  'anthropic:claude-sonnet-4-6',
 };
+
+export const DREAM_SYNTHESIZE_FALLBACKS_CONFIG_KEY = 'models.dream.synthesize_fallbacks';
+export const DREAM_PATTERNS_FALLBACKS_CONFIG_KEY = 'models.dream.patterns_fallbacks';
+
+export class ModelFallbackConfigError extends Error {
+  constructor(readonly key: string, message: string) {
+    super(`Invalid ${key}: ${message}`);
+    this.name = 'ModelFallbackConfigError';
+  }
+}
+
+export function parseModelFallbackConfig(raw: string | null | undefined, key: string): string[] {
+  if (raw === null || raw === undefined || raw.trim() === '') return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new ModelFallbackConfigError(
+      key,
+      `expected a JSON array of fully-qualified provider:model strings; JSON parse failed: ${detail}`,
+    );
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new ModelFallbackConfigError(
+      key,
+      'expected a JSON array of fully-qualified provider:model strings',
+    );
+  }
+
+  return parsed.map((entry, idx) => {
+    if (typeof entry !== 'string') {
+      throw new ModelFallbackConfigError(
+        key,
+        `entry ${idx} must be a string provider:model id; got ${typeof entry}`,
+      );
+    }
+    const model = entry.trim();
+    const { provider, model: modelId } = splitProviderModelId(model);
+    if (!model || provider === null || provider.trim() === '' || modelId.trim() === '' || !model.includes(':')) {
+      throw new ModelFallbackConfigError(
+        key,
+        `entry ${idx} must be a fully-qualified provider:model id; got ${JSON.stringify(entry)}`,
+      );
+    }
+    return model;
+  });
+}
+
+export async function resolveModelFallbackConfig(
+  engine: Pick<BrainEngine, 'getConfig'>,
+  key: string,
+): Promise<string[]> {
+  return parseModelFallbackConfig(await engine.getConfig(key), key);
+}
 
 /**
  * OpenAI static tier fallback — NO literal model pins. Derived from the

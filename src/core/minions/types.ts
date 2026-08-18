@@ -498,8 +498,15 @@ export interface SubagentHandlerData {
   prompt: string;
   /** Optional subagent definition path (skills/subagents/*.md or plugin). */
   subagent_def?: string;
-  /** Anthropic model id. Defaults to sonnet at handler resolution time. */
+  /** Primary `provider:model` id. Defaults to the configured subagent tier. */
   model?: string;
+  /**
+   * Ordered infrastructure fallback chain for the gateway-native loop.
+   * Values must be fully qualified `provider:model` ids with tool-calling
+   * support. The loop skips invalid entries and switches only on provider
+   * infrastructure failures, never refusals or tool/validation failures.
+   */
+  fallback_models?: string[];
   /** Max assistant turns before the loop fails with stop_reason='max_turns'. */
   max_turns?: number;
   /**
@@ -727,6 +734,15 @@ export interface SubagentResult {
     cache_read: number;
     cache_create: number;
   };
+  /** Durable gateway-native provider switches for postmortem and cost analysis. */
+  fallback_events?: Array<{
+    turnIdx: number;
+    primaryModel: string;
+    failedModel: string;
+    fallbackModel: string;
+    reason: 'rate_limit' | 'provider_unavailable' | 'network' | 'timeout';
+    error: string;
+  }>;
   /**
    * #4217 structural write accounting, merged by finalizeWriteAccounting on
    * every subagent job. attempted = settled rows only (complete + failed);

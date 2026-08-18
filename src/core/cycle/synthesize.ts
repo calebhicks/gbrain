@@ -54,6 +54,11 @@ import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gat
 import { AIConfigError } from '../ai/errors.ts';
 import { resolveChatContextTokens } from '../ai/model-resolver.ts';
 import { normalizeModelId, splitProviderModelId } from '../model-id.ts';
+import {
+  DREAM_SYNTHESIZE_FALLBACKS_CONFIG_KEY,
+  ModelFallbackConfigError,
+  resolveModelFallbackConfig,
+} from '../model-config.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import { basename, join, dirname, isAbsolute, resolve } from 'node:path';
 import { parseLlmJson } from '../llm-json.ts';
@@ -815,6 +820,7 @@ async function runPhaseSynthesizeInner(
             config.mode,
           ),
           model: subagentModel,
+          fallback_models: config.fallbackModels,
           max_turns: config.maxTurns,
           allowed_slug_prefixes: allowedSlugPrefixes,
           // #4216: execution mode + the structural slug-suffix contract
@@ -1315,6 +1321,14 @@ async function runPhaseSynthesizeInner(
       },
     });
   } catch (e) {
+    if (e instanceof ModelFallbackConfigError) {
+      return failed(makeError(
+        'ConfigError',
+        'DREAM_MODEL_FALLBACK_CONFIG_INVALID',
+        e.message,
+        `Set ${e.key} to a JSON array of provider:model strings, e.g. ["openai:gpt-5"].`,
+      ));
+    }
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
       e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
   } finally {
@@ -1371,6 +1385,7 @@ export interface SynthConfig {
   minChars: number;
   excludePatterns: string[];
   model: string;
+  fallbackModels: string[];
   triage: SynthTriageConfig;
   /** dream.synthesize.max_turns, default 16 (see DEFAULT_MAX_TURNS rationale), floor 1. */
   maxTurns: number;
@@ -1514,6 +1529,10 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     tier: 'reasoning',
     fallback: 'sonnet',
   });
+  const fallbackModels = await resolveModelFallbackConfig(
+    engine,
+    DREAM_SYNTHESIZE_FALLBACKS_CONFIG_KEY,
+  );
   // #4152 (eng-review 2A): `models.dream.triage` is the preferred key, read
   // via an EXPLICIT pre-read (not resolveModel's cliFlag slot — that slot
   // stays free for a future real CLI flag). Both legacy spellings keep
@@ -1626,6 +1645,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     minChars,
     excludePatterns,
     model,
+    fallbackModels,
     triage: {
       model: verdictModel,
       threshold: triageThreshold,

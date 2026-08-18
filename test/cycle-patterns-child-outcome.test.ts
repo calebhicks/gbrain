@@ -103,4 +103,52 @@ describe('runPhasePatterns child-outcome status (#2782)', () => {
       rmSync(brainDir, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test('models.dream.patterns_fallbacks flows to the submitted child job in order', async () => {
+    const brainDir = mkdtempSync(join(tmpdir(), 'gbrain-patterns-fallbacks-'));
+    try {
+      await seedReflections();
+      await engine.setConfig(
+        'models.dream.patterns_fallbacks',
+        JSON.stringify(['openai:gpt-5', 'google:gemini-3-pro']),
+      );
+      await engine.setConfig('dream.patterns.subagent_wait_timeout_ms', '1');
+
+      await withEnv({ ANTHROPIC_API_KEY: 'sk-ant-test' }, () =>
+        runPhasePatterns(engine, { brainDir, dryRun: false }),
+      );
+
+      const rows = await engine.executeRaw<{ data: string }>(
+        `SELECT data::text AS data FROM minion_jobs WHERE name = 'subagent' ORDER BY id DESC LIMIT 1`,
+      );
+      expect(rows).toHaveLength(1);
+      const data = JSON.parse(rows[0]!.data) as { fallback_models?: string[] };
+      expect(data.fallback_models).toEqual(['openai:gpt-5', 'google:gemini-3-pro']);
+    } finally {
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('malformed models.dream.patterns_fallbacks fails before child fan-out', async () => {
+    const brainDir = mkdtempSync(join(tmpdir(), 'gbrain-patterns-bad-fallbacks-'));
+    try {
+      await seedReflections();
+      await engine.setConfig('models.dream.patterns_fallbacks', 'not-json');
+
+      const result = await withEnv({ ANTHROPIC_API_KEY: 'sk-ant-test' }, () =>
+        runPhasePatterns(engine, { brainDir, dryRun: false }),
+      );
+
+      expect(result.status).toBe('fail');
+      expect(result.error?.message).toContain('models.dream.patterns_fallbacks');
+      expect(result.error?.message).toContain('JSON parse failed');
+
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM minion_jobs WHERE name = 'subagent'`,
+      );
+      expect(rows[0]!.count).toBe('0');
+    } finally {
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

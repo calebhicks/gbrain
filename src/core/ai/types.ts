@@ -517,8 +517,9 @@ export interface AIGatewayConfig {
   reranker_model?: string;
   /**
    * Optional silent-refusal fallback chain ("provider:modelId" entries).
-   * Plumbed for `chatWithFallback()` (commit 3). Blocked from critic/judge/
-   * synthesize flows in their respective handlers.
+   * Reserved for a chat-only refusal fallback path. It is not the control
+   * plane for critic/judge/synthesize or gateway tool-loop infrastructure
+   * fallback; subagent jobs use their own per-job `fallback_models` list.
    */
   chat_fallback_chain?: string[];
   /** Optional per-provider base URL override (openai-compatible variants). */
