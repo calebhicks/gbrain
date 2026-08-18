@@ -64,11 +64,7 @@ function projectPeopleCompaniesRefs(
 
 /** Extract title from page (first H1 or frontmatter title) */
 export function extractPageTitle(content: string): string {
-  const fmMatch = content.match(/^title:\s*"?(.+?)"?\s*$/m);
-  if (fmMatch) return fmMatch[1];
-  const h1Match = content.match(/^#\s+(.+)$/m);
-  if (h1Match) return h1Match[1].trim();
-  return 'Untitled';
+  return parseMarkdown(content).title;
 }
 
 /** Check if a page already contains a back-link to a given source file */
