@@ -221,6 +221,53 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(messages[1].message_idx).toBe(1);
   });
 
+  it('uses the subagent 8192 floor and recomputes a fallback model cap', async () => {
+    const seen: Array<{ model: string | undefined; maxTokens: number | undefined }> = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push({ model: opts.model, maxTokens: opts.maxTokens });
+      if (opts.model === 'anthropic:claude-sonnet-5') {
+        const err = new Error('provider unavailable') as Error & { status: number };
+        err.status = 503;
+        throw err;
+      }
+      return {
+        text: 'fallback done', blocks: [{ type: 'text', text: 'fallback done' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 2, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-4o', providerId: 'openai',
+      } satisfies ChatResult;
+    });
+    const handler = buildHandler([]);
+    const { ctx } = await makeFakeJob({
+      prompt: 'go', model: 'anthropic:claude-sonnet-5', fallback_models: ['openai:gpt-4o'],
+    });
+    const result = await handler(ctx);
+    expect(result.result).toBe('fallback done');
+    expect(seen).toEqual([
+      { model: 'anthropic:claude-sonnet-5', maxTokens: 32000 },
+      { model: 'openai:gpt-4o', maxTokens: 8192 },
+    ]);
+  });
+
+  it('replay classifies truncation against the persisted fallback model cap', async () => {
+    const handler = buildHandler([]);
+    const { jobId, ctx } = await makeFakeJob({
+      prompt: 'go', model: 'anthropic:claude-sonnet-5', fallback_models: ['openai:gpt-4o'],
+    });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages
+         (job_id, message_idx, role, content_blocks, tokens_out, model)
+       VALUES
+         ($1, 0, 'user', '[{"type":"text","text":"go"}]'::jsonb, NULL, NULL),
+         ($1, 1, 'assistant', '[{"type":"text","text":"truncated"}]'::jsonb, 8192, 'openai:gpt-4o')`,
+      [jobId],
+    );
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('max_tokens');
+    expect(result.result).toBe('truncated');
+  });
+
+
   it('openrouter:anthropic/… auto-routes through the gateway when the flag is off', async () => {
     await engine.unsetConfig('agent.use_gateway_loop');
     __setChatTransportForTests(async () => ({

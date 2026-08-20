@@ -274,7 +274,7 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
     expect(runBatchBlock).toContain('d.failures');
     expect(runBatchBlock).toContain('transcripts_processed');
     expect(runBatchBlock).toContain('pages_processed');
-    expect(runBatchBlock).toContain('providerFailure: failures.length > 0 && itemsSucceeded === 0');
+    expect(runBatchBlock).toContain('failures.length > 0 && itemsSucceeded === 0');
   });
 });
 

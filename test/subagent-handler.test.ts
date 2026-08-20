@@ -615,7 +615,11 @@ describe('makeSubagentHandler default client construction', () => {
 
 // ── #2778: per-turn output-token cap + max_tokens stop handling ─────
 
-import { resolveMaxOutputTokens } from '../src/core/minions/handlers/subagent.ts';
+import {
+  gatewayLeaseKeyForModel,
+  resolveExplicitMaxOutputTokens,
+  resolveMaxOutputTokens,
+} from '../src/core/minions/handlers/subagent.ts';
 
 describe('resolveMaxOutputTokens (#2778)', () => {
   test('defaults to 8192 when nothing set', () => {
@@ -637,6 +641,22 @@ describe('resolveMaxOutputTokens (#2778)', () => {
     expect(resolveMaxOutputTokens(Number.NaN, 'garbage')).toBe(8192);
     expect(resolveMaxOutputTokens(undefined, '')).toBe(8192);
     expect(resolveMaxOutputTokens(undefined, '0')).toBe(8192);
+  });
+
+  test('only valid job/config values become cross-model explicit overrides', () => {
+    expect(resolveExplicitMaxOutputTokens(12000, '9000')).toBe(12000);
+    expect(resolveExplicitMaxOutputTokens(undefined, '9000')).toBe(9000);
+    expect(resolveExplicitMaxOutputTokens(undefined, null)).toBeUndefined();
+    expect(resolveExplicitMaxOutputTokens(-1, 'garbage')).toBeUndefined();
+  });
+});
+
+describe('gatewayLeaseKeyForModel (#4194 fallback attempts)', () => {
+  test('uses the concrete attempt provider and preserves explicit test/operator overrides', () => {
+    expect(gatewayLeaseKeyForModel('anthropic:claude-sonnet-4-6')).toBe('anthropic:messages');
+    expect(gatewayLeaseKeyForModel('openai:gpt-4o')).toBe('openai:chat');
+    expect(gatewayLeaseKeyForModel('google:gemini-2.5-pro')).toBe('google:chat');
+    expect(gatewayLeaseKeyForModel('openai:gpt-4o', 'shared-test-key')).toBe('shared-test-key');
   });
 });
 

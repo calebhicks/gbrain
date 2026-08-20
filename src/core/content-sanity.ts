@@ -228,7 +228,7 @@ export const BUILT_IN_JUNK_PATTERNS: ReadonlyArray<JunkPattern> = Object.freeze(
   // motivating this change (202+ from straylight-brain).
   {
     name: 'error_page_title',
-    pattern: /^(403|404|500|502|503|error \d{3}|page not found|forbidden|access denied[.!]?|service unavailable|robot check|verify you are human)\s*$/i,
+    pattern: /^(403|404|500|502|503|error \d{3}|page not found|forbidden|access denied(?:[.!]?|\s*[-|:—–]\s*(?:sucuri(?: website firewall)?|akamai|cloudflare|imperva|incapsula|website firewall|request blocked)[.!]?)|service unavailable|robot check|verify you are human)\s*$/i,
     applies_to: 'title',
   },
   // Cloudflare challenge title (companion to the body-scoped

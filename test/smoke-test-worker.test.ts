@@ -32,7 +32,9 @@ case " $* " in
       printf '%s\\n' '{"running":true,"detected_via":"pidfile"}'
       exit 0
     fi
-    exit 1 ;;
+    # Prove smoke parses the typed payload instead of treating exit 0 as live.
+    printf '%s\\n' '{"running":false,"detected_via":null}'
+    exit 0 ;;
   *" jobs work "*) : > "$SMOKE_WORKER_STARTED"; exit 0 ;;
 esac
 exit 0
@@ -67,6 +69,16 @@ afterEach(() => {
 });
 
 describe('smoke-test worker health (#4175)', () => {
+  test('the self-contained timeout escalates to KILL while retaining child ownership', () => {
+    const source = readFileSync(SCRIPT, 'utf8');
+    expect(source).toContain('command -v perl');
+    expect(source).toContain('Minimal-host fallback');
+    expect(source).toContain('waitpid($pid, WNOHANG)');
+    expect(source).toContain('kill "TERM", $pid');
+    expect(source).toContain('kill "KILL", $pid');
+    expect(source).toContain('waitpid($pid, 0)');
+  });
+
   test('a healthy native supervisor prevents a duplicate unmanaged worker', () => {
     const result = runSmoke({ supervisorRunning: true });
 

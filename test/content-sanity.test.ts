@@ -204,11 +204,26 @@ describe('assessContentSanity — built-in junk patterns', () => {
     expect(r.shouldHardBlock).toBe(true);
   });
 
-  test('access_denied does not quarantine a substantive title beginning with the phrase', () => {
+  test.each([
+    'Access Denied - Sucuri Website Firewall',
+    'Access Denied | Akamai',
+    'Access Denied: request blocked',
+  ])('decorated WAF title %j remains blocked', (title) => {
+    const r = assessContentSanity({ compiled_truth: 'Sorry, you have been blocked.', timeline: '', title });
+    expect(r.junk_pattern_matches).toContain('error_page_title');
+    expect(r.shouldHardBlock).toBe(true);
+  });
+
+  test.each([
+    'Access Denied? Digital Access: The Right Thing, the Smart Thing, and the Required Thing to Do.',
+    'Access Denied: The Fight for Public Records in America',
+    'Access Denied — How Paywalls Reshaped Journalism',
+    'Access Denied | A Book Review of Digital Redlining',
+  ])('access_denied does not quarantine substantive title %j', (title) => {
     const r = assessContentSanity({
       compiled_truth: 'A substantive discussion of digital access and inclusion.',
       timeline: '',
-      title: 'Access Denied? Digital Access: The Right Thing, the Smart Thing, and the Required Thing to Do.',
+      title,
     });
     expect(r.junk_pattern_matches).toEqual([]);
     expect(r.shouldHardBlock).toBe(false);

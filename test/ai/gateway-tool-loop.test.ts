@@ -325,6 +325,60 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     expect(seen).toEqual([4096, 4096, 32000, 32000, 32000, 4096]);
   });
 
+  it('recomputes the default output cap for the fallback model', async () => {
+    const seen: Array<{ model: string | undefined; maxTokens: number | undefined }> = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push({ model: opts.model, maxTokens: opts.maxTokens });
+      if (opts.model === 'anthropic:claude-sonnet-5') {
+        const err = new Error('provider unavailable') as Error & { status: number };
+        err.status = 503;
+        throw err;
+      }
+      return {
+        text: 'ok', blocks: [{ type: 'text', text: 'ok' }] as ChatBlock[], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-4o', providerId: 'openai',
+      };
+    });
+
+    await toolLoop({
+      model: 'anthropic:claude-sonnet-5',
+      fallbackModels: ['openai:gpt-4o'],
+      initialMessages: [{ role: 'user', content: 'hi' }],
+      tools: [], toolHandlers: new Map(),
+    });
+    expect(seen).toEqual([
+      { model: 'anthropic:claude-sonnet-5', maxTokens: 32000 },
+      { model: 'openai:gpt-4o', maxTokens: 4096 },
+    ]);
+  });
+
+  it('lets a caller supply its own per-model default policy across fallbacks', async () => {
+    const seen: Array<{ model: string | undefined; maxTokens: number | undefined }> = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push({ model: opts.model, maxTokens: opts.maxTokens });
+      if (opts.model === 'anthropic:claude-sonnet-5') {
+        const err = new Error('provider unavailable') as Error & { status: number };
+        err.status = 503;
+        throw err;
+      }
+      return {
+        text: 'ok', blocks: [{ type: 'text', text: 'ok' }] as ChatBlock[], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-4o', providerId: 'openai',
+      };
+    });
+    await toolLoop({
+      model: 'anthropic:claude-sonnet-5', fallbackModels: ['openai:gpt-4o'],
+      initialMessages: [{ role: 'user', content: 'hi' }], tools: [], toolHandlers: new Map(),
+      maxTokensForModel: (model) => model.includes('sonnet-5') ? 32000 : 8192,
+    });
+    expect(seen).toEqual([
+      { model: 'anthropic:claude-sonnet-5', maxTokens: 32000 },
+      { model: 'openai:gpt-4o', maxTokens: 8192 },
+    ]);
+  });
+
   it('hits max_turns when the model keeps calling tools', async () => {
     __setChatTransportForTests(async () => ({
       text: '',
@@ -589,6 +643,117 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     ]);
   });
 
+  it('preserves a balanced tool transcript across a real cross-provider fallback', async () => {
+    let calls = 0;
+    let executes = 0;
+    let fallbackMessages: any[] | undefined;
+    __setGenerateTextTransportForTests(async (args: any) => {
+      calls++;
+      if (calls === 1) {
+        return {
+          content: [{ type: 'tool-call', toolCallId: 'tc-real', toolName: 'search', input: { q: 'x' } }],
+          finishReason: 'tool-calls',
+          usage: { inputTokens: 1, outputTokens: 1 },
+        } as any;
+      }
+      if (calls === 2) {
+        const err = new Error('primary upstream 500') as Error & { status: number };
+        err.status = 500;
+        throw err;
+      }
+      fallbackMessages = args.messages;
+      return {
+        content: [{ type: 'text', text: 'fallback done' }],
+        finishReason: 'stop',
+        usage: { inputTokens: 2, outputTokens: 2 },
+      } as any;
+    });
+
+    const result = await toolLoop({
+      model: 'anthropic:claude-sonnet-4-6',
+      fallbackModels: ['openai:gpt-4o'],
+      initialMessages: [{ role: 'user', content: 'go' }],
+      tools: [{ name: 'search', description: 's', inputSchema: { type: 'object' } }],
+      toolHandlers: new Map([['search', {
+        idempotent: true,
+        async execute() { executes++; return { hits: 1 }; },
+      }]]),
+    });
+
+    expect(result.finalText).toBe('fallback done');
+    expect(executes).toBe(1);
+    expect(calls).toBe(3);
+    expect(fallbackMessages?.map((m) => m.role)).toEqual(['user', 'assistant', 'tool']);
+    const assistant = fallbackMessages?.find((m) => m.role === 'assistant');
+    const tool = fallbackMessages?.find((m) => m.role === 'tool');
+    expect(assistant?.content?.[0]).toMatchObject({
+      type: 'tool-call', toolCallId: 'tc-real', toolName: 'search', input: { q: 'x' },
+    });
+    expect(tool?.content?.[0]).toMatchObject({
+      type: 'tool-result', toolCallId: 'tc-real', toolName: 'search',
+    });
+  });
+
+  it('redacts and bounds provider tenancy data in fallback receipts', async () => {
+    __setChatTransportForTests(async (opts) => {
+      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+        const err = new Error(`org_id=org-secret tenant 123\n${'x'.repeat(400)}`) as Error & { status: number };
+        err.status = 503;
+        throw err;
+      }
+      return {
+        text: 'ok', blocks: [{ type: 'text', text: 'ok' }] as ChatBlock[], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-4o', providerId: 'openai',
+      };
+    });
+    const result = await toolLoop({
+      model: 'anthropic:claude-sonnet-4-6', fallbackModels: ['openai:gpt-4o'],
+      initialMessages: [{ role: 'user', content: 'go' }], tools: [], toolHandlers: new Map(),
+    });
+    expect(result.fallbackEvents?.[0]?.error).toContain('org_id=[redacted]');
+    expect(result.fallbackEvents?.[0]?.error).not.toContain('org-secret');
+    expect(result.fallbackEvents?.[0]?.error.length).toBeLessThanOrEqual(240);
+  });
+
+  it('redacts the terminal llm_call_failed heartbeat in the same audit sink', async () => {
+    const heartbeats: Array<{ event: string; data: Record<string, unknown> }> = [];
+    __setChatTransportForTests(async () => {
+      throw new Error('request_id=req_supersecret123456 sk-live-supersecret123456 org_id=tenant-secret');
+    });
+    await expect(toolLoop({
+      model: 'anthropic:claude-sonnet-4-6',
+      initialMessages: [{ role: 'user', content: 'go' }], tools: [], toolHandlers: new Map(),
+      onHeartbeat: (event, data) => heartbeats.push({ event, data }),
+    })).rejects.toThrow();
+    const failure = heartbeats.find(h => h.event === 'llm_call_failed');
+    expect(failure?.data.error).toContain('request_id=[redacted]');
+    expect(failure?.data.error).toContain('[redacted-token]');
+    expect(failure?.data.error).not.toContain('supersecret');
+    expect(failure?.data.error).not.toContain('tenant-secret');
+  });
+
+  it('redacts space-delimited provider organization, tenant, and request ids', async () => {
+    const heartbeats: Array<{ event: string; data: Record<string, unknown> }> = [];
+    __setChatTransportForTests(async () => {
+      throw new Error(
+        'Rate limit reached in organization org-7QkLm2XyZ9AbCd tenant 123 ' +
+        'x-request-id 3f0aa1bb9c2d4e5f8a7b6c5d4e3f2a1b',
+      );
+    });
+    await expect(toolLoop({
+      model: 'openai:gpt-4o', initialMessages: [{ role: 'user', content: 'go' }],
+      tools: [], toolHandlers: new Map(),
+      onHeartbeat: (event, data) => heartbeats.push({ event, data }),
+    })).rejects.toThrow();
+    const error = String(heartbeats.find(h => h.event === 'llm_call_failed')?.data.error);
+    expect(error).toContain('organization=[redacted]');
+    expect(error).toContain('tenant=[redacted]');
+    expect(error).toContain('x-request-id=[redacted]');
+    expect(error).not.toContain('7QkLm2XyZ9AbCd');
+    expect(error).not.toContain('3f0aa1bb9c2d4e5f8a7b6c5d4e3f2a1b');
+  });
+
   it('skips invalid fallback models deterministically', async () => {
     const seenModels: string[] = [];
     __setChatTransportForTests(async (opts) => {
@@ -643,6 +808,64 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     expect(calls).toBe(1);
   });
 
+  it('preserves the requested model across multi-turn no-fallback loops', async () => {
+    const seenModels: Array<string | undefined> = [];
+    let turn = 0;
+    __setChatTransportForTests(async (opts) => {
+      seenModels.push(opts.model);
+      turn++;
+      if (turn === 1) {
+        return {
+          text: '',
+          blocks: [{ type: 'tool-call', toolCallId: 'tc1', toolName: 'work', input: {} }] as ChatBlock[],
+          stopReason: 'tool_calls',
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          // Provider echoes a resolved snapshot; it must not change turn 2.
+          model: 'anthropic:claude-sonnet-4-6-20260801',
+          providerId: 'anthropic',
+        };
+      }
+      return {
+        text: 'done',
+        blocks: [{ type: 'text', text: 'done' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-sonnet-4-6-20260801',
+        providerId: 'anthropic',
+      };
+    });
+
+    await toolLoop({
+      model: 'anthropic:claude-sonnet-4-6',
+      initialMessages: [{ role: 'user', content: 'go' }],
+      tools: [{ name: 'work', description: 'w', inputSchema: { type: 'object' } }],
+      toolHandlers: new Map([['work', { idempotent: true, async execute() { return null; } }]]),
+    });
+    expect(seenModels).toEqual([
+      'anthropic:claude-sonnet-4-6',
+      'anthropic:claude-sonnet-4-6',
+    ]);
+  });
+
+  it('does not fall back when the caller abort caused a timeout-shaped error', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      controller.abort('deadline');
+      throw new DOMException('The operation timed out.', 'TimeoutError');
+    });
+    await expect(toolLoop({
+      model: 'anthropic:claude-sonnet-4-6',
+      fallbackModels: ['openai:gpt-4o'],
+      abortSignal: controller.signal,
+      initialMessages: [{ role: 'user', content: 'hi' }],
+      tools: [],
+      toolHandlers: new Map(),
+    })).rejects.toThrow('timed out');
+    expect(calls).toBe(1);
+  });
+
   it('classifies only explicit provider infrastructure failures as fallback-eligible', () => {
     const rate = new Error('too many') as Error & { status: number };
     rate.status = 429;
@@ -659,6 +882,37 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
   });
 
   describe('acquireTurnPermit hook (#4194 CDX-7 — per-turn rate leases on the gateway path)', () => {
+    it('acquires and releases a separate permit for every fallback attempt', async () => {
+      const events: string[] = [];
+      __setChatTransportForTests(async (opts) => {
+        events.push(`chat:${opts.model}`);
+        if (opts.model === 'anthropic:claude-sonnet-4-6') {
+          const err = new Error('provider unavailable') as Error & { status: number };
+          err.status = 503;
+          throw err;
+        }
+        return {
+          text: 'done', blocks: [{ type: 'text', text: 'done' }] as ChatBlock[], stopReason: 'end',
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'openai:gpt-4o', providerId: 'openai',
+        };
+      });
+      await toolLoop({
+        model: 'anthropic:claude-sonnet-4-6',
+        fallbackModels: ['openai:gpt-4o'],
+        initialMessages: [{ role: 'user', content: 'go' }],
+        tools: [], toolHandlers: new Map(),
+        acquireTurnPermit: async (model) => {
+          events.push(`acquire:${model}`);
+          return () => { events.push('release'); };
+        },
+      });
+      expect(events).toEqual([
+        'acquire:anthropic:claude-sonnet-4-6', 'chat:anthropic:claude-sonnet-4-6', 'release',
+        'acquire:openai:gpt-4o', 'chat:openai:gpt-4o', 'release',
+      ]);
+    });
+
     it('acquires before EVERY provider call and releases after each (incl. the final turn)', async () => {
       const events: string[] = [];
       let turn = 0;
@@ -740,13 +994,18 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     it('object-form permit: release runs, and aborting the permit signal aborts the in-flight call', async () => {
       const events: string[] = [];
       const leaseLost = new AbortController();
-      __setChatTransportForTests(async (opts: any) =>
-        new Promise((_, reject) => {
+      let calls = 0;
+      __setChatTransportForTests(async (opts: any) => {
+        calls++;
+        return new Promise((_, reject) => {
           opts.abortSignal?.addEventListener('abort', () =>
-            reject(new DOMException('lease pruned mid-call', 'AbortError')));
-        }));
+            reject(new DOMException('lease pruned mid-call', 'TimeoutError')));
+        });
+      });
 
       const loop = toolLoop({
+        model: 'anthropic:claude-sonnet-4-6',
+        fallbackModels: ['openai:gpt-4o'],
         initialMessages: [{ role: 'user', content: 'go' }],
         tools: [],
         toolHandlers: new Map(),
@@ -757,6 +1016,8 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
       });
       setTimeout(() => leaseLost.abort(), 20);
       await expect(loop).rejects.toThrow('lease pruned mid-call');
+      // Lease-loss cancellation is not a provider outage: no fallback call.
+      expect(calls).toBe(1);
       // The permit was still released (finally bracket) even on abort.
       expect(events).toEqual(['release']);
     });
