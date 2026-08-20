@@ -52,7 +52,7 @@ import { resolveModel, isAnthropicProvider, isOpenRouterSubagentFamily, TIER_DEF
 import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
-import { toolLoop as gatewayToolLoop, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
+import { toolLoop as gatewayToolLoop } from '../../ai/gateway.ts';
 import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
@@ -75,13 +75,22 @@ import { applyDelegatedData, guardDelegatedTools } from '../delegated-tools.ts';
 import { withDelegatedSpend } from '../delegated-spend.ts';
 import { invokeAI, sdkInvocationUsage, hasAIInvocationGuard } from '../../ai/invocation-guard.ts';
 import { chatInvocation } from '../../ai/guarded-generation.ts';
+import {
+  DEFAULT_RATE_KEY,
+  gatewayLeaseKeyForModel,
+  resolveExplicitMaxOutputTokens,
+  resolveMaxOutputTokens,
+} from './subagent-gateway-policy.ts';
+export {
+  gatewayLeaseKeyForModel,
+  resolveExplicitMaxOutputTokens,
+  resolveMaxOutputTokens,
+} from './subagent-gateway-policy.ts';
 
 // ── Defaults ────────────────────────────────────────────────
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_MAX_TURNS = 20;
-const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
-const DEFAULT_RATE_KEY = 'anthropic:messages';
 
 /**
  * Resolve the per-turn output-token cap (#2778). Per-job data wins, then the
@@ -92,21 +101,6 @@ const DEFAULT_RATE_KEY = 'anthropic:messages';
  * else (was a hardcoded 4096 that made pages >~12KB unwritable via put_page).
  * Invalid values (NaN / zero / negative) fall through to the next tier.
  */
-export function resolveMaxOutputTokens(
-  perJob: number | undefined,
-  configRaw: string | null | undefined,
-  model?: string,
-): number {
-  if (typeof perJob === 'number' && Number.isFinite(perJob) && perJob > 0) {
-    return Math.floor(perJob);
-  }
-  if (typeof configRaw === 'string' && configRaw.trim() !== '') {
-    const n = Number(configRaw);
-    if (Number.isFinite(n) && n > 0) return Math.floor(n);
-  }
-  return isThinkingModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
-}
-
 /**
  * Resolve the rate-lease cap from the env var.
  *
@@ -209,14 +203,14 @@ export interface SubagentDeps {
  */
 async function runLoopConvertingLeaseLoss<T>(
   run: () => Promise<T>,
-  wasLeaseLost: () => boolean,
-  leaseKey: string,
+  lostLeaseKey: () => string | null,
   maxConcurrent: number,
 ): Promise<T> {
   try {
     return await run();
   } catch (e) {
-    if (wasLeaseLost()) {
+    const leaseKey = lostLeaseKey();
+    if (leaseKey !== null) {
       throw new RateLeaseUnavailableError(leaseKey, maxConcurrent, maxConcurrent);
     }
     // Same terminal classification the legacy raw-SDK path applies below
@@ -426,11 +420,10 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // default (#4087/CDX-6: thinking-by-default Claude 5 models get 32k so the
     // 8192 handler default stops masking the gateway's own headroom; explicit
     // per-job/config values always win).
-    const maxOutputTokens = resolveMaxOutputTokens(
-      data.max_tokens,
-      await engine.getConfig('agent.max_output_tokens').catch(() => null),
-      model,
-    );
+    const configuredMaxOutputTokens = await engine.getConfig('agent.max_output_tokens').catch(() => null);
+    const explicitMaxOutputTokens = resolveExplicitMaxOutputTokens(data.max_tokens, configuredMaxOutputTokens);
+    const maxOutputTokens = explicitMaxOutputTokens
+      ?? resolveMaxOutputTokens(undefined, null, model);
     // v0.41 Approach C: systemPrompt is now built AFTER toolDefs (a few
     // lines below) so the renderer can splice a tool-usage preamble
     // listing each available tool's usage_hint. The renderer is
@@ -494,12 +487,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       allowed_tools: toolDefs.map(t => t.name),
     });
 
-    // OV-10: provider-derived lease key. Anthropic-family models keep the
-    // legacy 'anthropic:messages' bucket (one shared ceiling per API, not
-    // one per code path); everything else gets its own recipe bucket.
-    const recipeId = recipeIdFromModel(model);
-    const gatewayLeaseKey = deps.rateLeaseKey
-      ?? (recipeId === 'anthropic' ? DEFAULT_RATE_KEY : `${recipeId}:chat`);
+    const gatewayLeaseKey = gatewayLeaseKeyForModel(model, deps.rateLeaseKey);
 
     // ── #4216 oneshot dispatch ──────────────────────────────
     // Runs ONLY on a fresh job (CDX-2: zero persisted messages — any prior
@@ -577,7 +565,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         toolDefs,
         maxTurns,
         maxOutputTokens,
-        leaseKey: gatewayLeaseKey,
+        explicitMaxOutputTokens,
+        leaseKeyOverride: deps.rateLeaseKey,
         maxConcurrent,
         leaseTtlMs,
       });
@@ -1141,6 +1130,8 @@ interface GatewayRunArgs {
   maxTurns: number;
   /** #2778: per-turn output-token cap (resolved by resolveMaxOutputTokens). */
   maxOutputTokens: number;
+  /** Explicit job/config override; undefined lets each fallback model use its own default. */
+  explicitMaxOutputTokens?: number;
   /**
    * #4194/CDX-7 — per-turn rate-lease parameters. Pre-fix the gateway path
    * made provider calls with no lease at all (the legacy loop's acquisition
@@ -1149,7 +1140,7 @@ interface GatewayRunArgs {
    * share the legacy 'anthropic:messages' bucket; other providers get their
    * own '<recipeId>:chat' bucket instead of contending for Anthropic slots.
    */
-  leaseKey: string;
+  leaseKeyOverride?: string;
   maxConcurrent: number;
   leaseTtlMs: number;
 }
@@ -1169,7 +1160,10 @@ interface GatewayRunArgs {
  * reconciler sees both shapes uniformly.
  */
 async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResult> {
-  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, leaseKey, maxConcurrent, leaseTtlMs } = args;
+  const {
+    engine, ctx, data, model, systemPrompt, toolDefs, maxTurns,
+    maxOutputTokens, explicitMaxOutputTokens, leaseKeyOverride, maxConcurrent, leaseTtlMs,
+  } = args;
 
   // Map ToolDef → ChatToolDef (gateway shape). The gateway's chat() bridges
   // this to provider-specific tool definitions via the Vercel AI SDK.
@@ -1242,10 +1236,12 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   // so surface the persisted text and skip the loop entirely.
   if (terminalText !== null) {
     const lastAssistant = [...priorMessages].reverse().find(m => m.role === 'assistant');
+    const replayOutputCap = explicitMaxOutputTokens
+      ?? resolveMaxOutputTokens(undefined, null, lastAssistant?.model ?? model);
     return {
       result: terminalText,
       turns_count: priorChatMessages.filter(m => m.role === 'assistant').length,
-      stop_reason: replayTerminalStopReason(lastAssistant?.tokens_out, maxOutputTokens),
+      stop_reason: replayTerminalStopReason(lastAssistant?.tokens_out, replayOutputCap),
       tokens: priorTokens,
     };
   }
@@ -1291,7 +1287,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   // wrapper below converts the resulting abort into a lease-full requeue so
   // the job retries WITHOUT burning an attempt instead of dying on a
   // generic AbortError.
-  let leaseLostDuringTurn = false;
+  let leaseLostDuringTurn: string | null = null;
 
   // Run the loop.
   const result = await runLoopConvertingLeaseLoss(
@@ -1303,14 +1299,20 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     tools: chatTools,
     toolHandlers,
     maxTurns,
-    maxTokens: maxOutputTokens,
+    // An explicit per-job/config cap applies across the chain. Otherwise the
+    // gateway recomputes its model-aware default for every fallback attempt.
+    maxTokens: explicitMaxOutputTokens,
+    maxTokensForModel: explicitMaxOutputTokens === undefined
+      ? (attemptModel) => resolveMaxOutputTokens(undefined, null, attemptModel)
+      : undefined,
     abortSignal: ctx.signal,
     cacheSystem,
     // #4194/CDX-7: every provider round-trip holds a rate-lease slot (worker
     // parity with the legacy loop's per-turn acquisition). Lease-full throws
     // RateLeaseUnavailableError out of the loop → worker/inline-drain requeue
     // WITHOUT burning an attempt.
-    acquireTurnPermit: async () => {
+    acquireTurnPermit: async (attemptModel) => {
+      const leaseKey = gatewayLeaseKeyForModel(attemptModel, leaseKeyOverride);
       const lease = await acquireLease(engine, leaseKey, ctx.id, maxConcurrent, { ttlMs: leaseTtlMs });
       if (!lease.acquired) {
         throw new RateLeaseUnavailableError(leaseKey, lease.activeCount, lease.maxConcurrent);
@@ -1332,7 +1334,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
         void renewLeaseWithBackoff(engine, lease.leaseId!, leaseTtlMs)
           .then((ok) => {
             if (!ok) {
-              leaseLostDuringTurn = true;
+              leaseLostDuringTurn = leaseKey;
               leaseLost.abort();
             }
           })
@@ -1456,7 +1458,6 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     onHeartbeat: heartbeat,
     }),
     () => leaseLostDuringTurn,
-    leaseKey,
     maxConcurrent,
   );
 

@@ -61,6 +61,7 @@ import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-ke
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runWithToolLoopFallback, type ToolLoopFallbackEvent } from './tool-loop-fallback.ts';
+import { callWithProviderPermit, safeFallbackError, type ToolLoopTurnPermit } from './tool-loop-runtime.ts';
 export {
   classifyToolLoopFallbackFailure,
   runWithToolLoopFallback,
@@ -4225,6 +4226,8 @@ export interface ToolLoopOpts {
   maxTurns?: number;
   /** Per-turn max output tokens. Default 4096. */
   maxTokens?: number;
+  /** Optional per-attempt resolver; used when fallback models need distinct defaults. */
+  maxTokensForModel?: (model: string) => number;
   abortSignal?: AbortSignal;
   /**
    * Ask for the stable prefix (system + last tool) to be cached. Forwarded to
@@ -4288,12 +4291,10 @@ export interface ToolLoopOpts {
    * would run above the concurrency ceiling). Absent = unmetered (CLI
    * one-shots, tests).
    */
-  acquireTurnPermit?: () => Promise<TurnPermit>;
+  acquireTurnPermit?: (model: string) => Promise<TurnPermit>;
 }
 
-export type TurnPermit =
-  | (() => Promise<void> | void)
-  | { release: () => Promise<void> | void; signal?: AbortSignal };
+export type TurnPermit = ToolLoopTurnPermit;
 
 export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
 
@@ -4326,7 +4327,6 @@ export interface ToolLoopResult {
  */
 export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
   const maxTurns = opts.maxTurns ?? 20;
-  const maxTokens = opts.maxTokens ?? defaultMaxOutputTokens(opts.model ?? getChatModel());
   const handlers = opts.toolHandlers;
   const fallbackEvents: ToolLoopFallbackEvent[] = [];
   const totalUsage: ChatResult['usage'] = {
@@ -4358,58 +4358,59 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
 
     opts.onHeartbeat?.('turn_start', { turn_idx: turnIdx });
 
-    // #4194/CDX-7: per-turn provider permit. Pre-hook, the gateway path made
+    // #4194/CDX-7: per-provider-call permit. Pre-hook, the gateway path made
     // provider calls with NO rate lease at all — the legacy Anthropic loop
     // acquired one per turn, so "leases are the API ceiling" was silently
     // false for every gateway-routed job the moment the inline drain (or a
     // worker fleet) ran concurrently. The hook acquires BEFORE the provider
     // call and releases in finally; an acquire failure (lease full)
     // propagates to the caller's requeue-without-attempt-burn handling.
-    let releaseTurnPermit: (() => Promise<void> | void) | null = null;
-    let turnPermitSignal: AbortSignal | undefined;
-    if (opts.acquireTurnPermit) {
-      const permit = await opts.acquireTurnPermit();
-      if (typeof permit === 'function') {
-        releaseTurnPermit = permit;
-      } else {
-        releaseTurnPermit = permit.release;
-        turnPermitSignal = permit.signal;
-      }
-    }
+    let providerCallAborted = false;
+    const callModel = async (model: string | undefined): Promise<ChatResult> => {
+      const requestedModel = model ?? getChatModel();
+      return callWithProviderPermit({
+        acquire: opts.acquireTurnPermit
+          ? () => opts.acquireTurnPermit!(requestedModel)
+          : undefined,
+        callerSignal: opts.abortSignal,
+        onAbortObserved: (aborted) => { providerCallAborted = aborted; },
+        call: (abortSignal) => chat({
+          model,
+          system: opts.system,
+          messages,
+          tools: opts.tools,
+          maxTokens: opts.maxTokensForModel?.(requestedModel)
+            ?? opts.maxTokens
+            ?? defaultMaxOutputTokens(requestedModel),
+          abortSignal,
+          cacheSystem: opts.cacheSystem,
+        }),
+      });
+    };
     let chatResult: ChatResult;
     try {
-      const chatArgs = {
-        model: activeModel,
-        system: opts.system,
-        messages,
-        tools: opts.tools,
-        maxTokens,
-        abortSignal: turnPermitSignal
-          ? (opts.abortSignal ? AbortSignal.any([opts.abortSignal, turnPermitSignal]) : turnPermitSignal)
-          : opts.abortSignal,
-        cacheSystem: opts.cacheSystem,
-      };
       chatResult = opts.fallbackModels && opts.fallbackModels.length > 0
         ? await runWithToolLoopFallback({
-            primaryModel: chatArgs.model ?? getChatModel(),
+            primaryModel: activeModel ?? getChatModel(),
             fallbackModels: opts.fallbackModels,
             turnIdx,
-            call: (model) => chat({ ...chatArgs, model }),
+            call: callModel,
             onHeartbeat: opts.onHeartbeat,
             onModelFallback: opts.onModelFallback,
+            isAborted: () => opts.abortSignal?.aborted === true || providerCallAborted,
           }, fallbackEvents)
-        : await chat(chatArgs);
+        : await callModel(activeModel);
     } catch (err) {
       if (isAIInvocationPolicyError(err)) throw err;
       opts.onHeartbeat?.('llm_call_failed', {
         turn_idx: turnIdx,
-        error: err instanceof Error ? err.message : String(err),
+        error: safeFallbackError(err),
       });
       throw err;
-    } finally {
-      if (releaseTurnPermit) await Promise.resolve(releaseTurnPermit()).catch(() => { /* best-effort */ });
     }
-    activeModel = chatResult.model;
+    if (opts.fallbackModels && opts.fallbackModels.length > 0) {
+      activeModel = chatResult.model;
+    }
 
     totalUsage.input_tokens += chatResult.usage.input_tokens;
     totalUsage.output_tokens += chatResult.usage.output_tokens;
