@@ -113,6 +113,45 @@ describe('applyAliasHop', () => {
     expect(out.length).toBe(0); // >6 tokens → skipped
   });
 
+  test('qualified prose resolves an unambiguous 3+ token alias phrase', async () => {
+    await engine.putPage('values/connect-the-dots', { type: 'concept', title: 'Connect the Dots', compiled_truth: 'x' });
+    await engine.setPageAliases('values/connect-the-dots', 'default', ['connecting evidence across teams']);
+    const out = await applyAliasHop(
+      engine,
+      [res('notes/unrelated', 0.5)],
+      'company value about connecting evidence across teams',
+      { sourceId: 'default' },
+    );
+    expect(out[0].slug).toBe('values/connect-the-dots');
+    expect(out[0].alias_hit).toBe(true);
+  });
+
+  test('qualified prose does not use a two-token ambient alias', async () => {
+    await engine.putPage('concepts/customer-trust', { type: 'concept', title: 'Customer Trust', compiled_truth: 'x' });
+    await engine.setPageAliases('concepts/customer-trust', 'default', ['customer trust']);
+    const out = await applyAliasHop(
+      engine,
+      [],
+      'what did we learn about customer trust last quarter',
+      { sourceId: 'default' },
+    );
+    expect(out).toEqual([]);
+  });
+
+  test('qualified prose skips an ambiguous alias phrase', async () => {
+    await engine.putPage('a/value', { type: 'concept', title: 'A', compiled_truth: 'x' });
+    await engine.putPage('b/value', { type: 'concept', title: 'B', compiled_truth: 'x' });
+    await engine.setPageAliases('a/value', 'default', ['connecting evidence across teams']);
+    await engine.setPageAliases('b/value', 'default', ['connecting evidence across teams']);
+    const out = await applyAliasHop(
+      engine,
+      [],
+      'company value about connecting evidence across teams',
+      { sourceId: 'default' },
+    );
+    expect(out).toEqual([]);
+  });
+
   test('collision: two pages claim one alias → both injected, capped + deterministic', async () => {
     await engine.putPage('a/hall', { type: 'note', title: 'A Hall', compiled_truth: 'x' });
     await engine.putPage('b/hall', { type: 'note', title: 'B Hall', compiled_truth: 'x' });

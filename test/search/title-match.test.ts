@@ -27,6 +27,12 @@ describe('isTitlePhraseMatch — positive (the incident)', () => {
   test('exact full-title match with punctuation/stopwords normalized', () => {
     expect(isTitlePhraseMatch('the hall of light', 'The Hall of Light')).toBe(true);
   });
+  test('named title inside a longer qualified query', () => {
+    expect(isTitlePhraseMatch('Trevor Goertzen meetings', 'Trevor Goertzen')).toBe(true);
+  });
+  test('multi-token concept title inside a longer query', () => {
+    expect(isTitlePhraseMatch('renewal risk enrollment decline', 'risk enrollment decline')).toBe(true);
+  });
 });
 
 describe('isTitlePhraseMatch — negative (precision guard)', () => {
@@ -37,6 +43,9 @@ describe('isTitlePhraseMatch — negative (precision guard)', () => {
   });
   test('single stopword does NOT match', () => {
     expect(isTitlePhraseMatch('the', MINGTANG)).toBe(false);
+  });
+  test('single-token title inside a longer query does NOT match', () => {
+    expect(isTitlePhraseMatch('Milbank budget objection', 'Milbank')).toBe(false);
   });
   test('non-contiguous tokens do NOT match (phrase, not bag-of-words)', () => {
     // "greek" and "indoor" both present but not contiguous in query order.
