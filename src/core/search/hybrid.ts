@@ -435,12 +435,14 @@ export function applyRecencyBoost(
  * T2 (retrieval-maxpool incident) — apply the title-phrase boost.
  *
  * Fires when the normalized query is a contiguous token-run inside a result's
- * page title (or an exact full-title match), per `isTitlePhraseMatch`. Mutate-
- * in-place; caller re-sorts. Mirrors applyBacklinkBoost's floor-gate + stamp.
+ * page title, the multi-token title is a contiguous run inside a qualified
+ * query, or both are exact, per `isTitlePhraseMatch`. Mutate-in-place; caller
+ * re-sorts.
  *
  * Bounded by construction: a single fixed multiplier (`factor`, default 1.25),
- * floor-ratio-gated so a title hit on a weak-overlap page can't leapfrog a
- * strong primary hit. `base_score` (stamped at runPostFusionStages entry) is
+ * The optional floor remains for direct callers, but the production stage does
+ * not apply the metadata-authority floor: title wording is direct lexical
+ * relevance evidence. `base_score` (stamped at runPostFusionStages entry) is
  * NOT touched, so the agent's dedup gate still reads true match confidence.
  *
  * Why page.title and not "first compiled_truth chunk" (Codex#11): the title is
@@ -660,12 +662,14 @@ export async function runPostFusionStages(
   }
 
   // T2 — title-phrase boost. Runs after the metadata stages, before graph
-  // signals. Shares the single floor-threshold so a title hit on a weak page
-  // can't leapfrog a strong primary hit (Codex#10). Fail-soft: pure + in-memory,
-  // but guarded so a bad query/title can't throw the whole pipeline.
+  // signals. Unlike metadata authority signals, an exact multi-token title
+  // phrase is direct lexical relevance evidence, so it must not inherit the
+  // metadata floor: doing so made the strongest named-page candidate
+  // ineligible precisely when semantic fusion initially ranked it too low.
+  // The matcher itself carries the two-content-token precision guard.
   if (opts.query && opts.titleBoost && opts.titleBoost > 1.0) {
     try {
-      applyTitleBoost(results, opts.query, opts.titleBoost, floorThreshold);
+      applyTitleBoost(results, opts.query, opts.titleBoost);
     } catch {
       // Non-fatal; preserves the per-stage contract.
     }
@@ -896,21 +900,47 @@ async function applyAliasResolvedBoost(
 // T3 — free-text alias hop tuning.
 const ALIAS_HOP_PRESENT_BOOST = 1.10; // bounded boost when canonical already in results
 const MAX_ALIAS_QUERY_TOKENS = 6;     // skip long queries (clearly not a chosen name)
+const MIN_QUALIFIED_ALIAS_TOKENS = 3; // phrase inside prose must be specific
+const MAX_QUALIFIED_QUERY_TOKENS = 14; // bound the n-gram lookup fan-out
 const MAX_ALIAS_INJECT = 3;           // cap injected pages per query (collision safety)
+
+/**
+ * Exact chosen-name aliases remain the primary path. For a natural-language
+ * query, also surface contiguous 3–6 token alias phrases, longest first. This
+ * lets ontology vocabulary participate in real questions ("company value
+ * about connecting evidence across teams") without turning one- or two-word
+ * aliases into ambient keyword boosts.
+ */
+function aliasQueryCandidates(qNorm: string): string[] {
+  const tokens = qNorm.split(' ').filter(Boolean);
+  const out: string[] = [];
+  if (tokens.length <= MAX_ALIAS_QUERY_TOKENS) out.push(qNorm);
+  if (tokens.length < MIN_QUALIFIED_ALIAS_TOKENS || tokens.length > MAX_QUALIFIED_QUERY_TOKENS) {
+    return out;
+  }
+  for (let size = Math.min(MAX_ALIAS_QUERY_TOKENS, tokens.length - 1); size >= MIN_QUALIFIED_ALIAS_TOKENS; size--) {
+    for (let start = 0; start + size <= tokens.length; start++) {
+      out.push(tokens.slice(start, start + size).join(' '));
+    }
+  }
+  return [...new Set(out)];
+}
 
 /**
  * T3 — free-text alias hop (retrieval-maxpool incident, the named-thing fix).
  *
- * When the normalized query EXACTLY matches a page's declared alias
+ * When the normalized query exactly matches a page's declared alias
  * ("Hall of Light" / "明堂" -> the Mingtang page), make sure that page is in
  * the result set: boost it if already present, inject it at top-of-organic +
- * epsilon if absent. This is the only layer that bridges true synonyms with
- * zero surface overlap — neither max-pool nor title-boost can.
+ * epsilon if absent. A qualified natural-language query may also match one
+ * unambiguous contiguous 3–6 token alias phrase. This is the only layer that
+ * bridges true synonyms with zero surface overlap — neither max-pool nor
+ * title-boost can.
  *
  * Precision guards (Codex#7/#10):
- *   - FULL normalized-query exact match only (not substring / not n-grams) —
- *     "light" won't fire unless the whole query normalizes to a stored alias.
- *   - skip queries longer than MAX_ALIAS_QUERY_TOKENS (clearly prose, not a name).
+ *   - exact full-query aliases preserve the original behavior, including
+ *     collisions; qualified aliases require >=3 contiguous tokens and exactly
+ *     one canonical page, with bounded query/phrase lengths.
  *   - bounded: present-boost is 1.10x; inject score is top-of-organic + ε,
  *     never an absolute 1.0 (D3 — aliases are not a ranking sledgehammer).
  *   - collisions (two pages claim one alias): deterministic alpha order, capped.
@@ -926,15 +956,24 @@ export async function applyAliasHop(
 ): Promise<SearchResult[]> {
   if (!query) return results;
   const qNorm = normalizeAlias(query);
-  if (!qNorm || qNorm.split(' ').length > MAX_ALIAS_QUERY_TOKENS) return results;
+  if (!qNorm) return results;
+  const candidates = aliasQueryCandidates(qNorm);
+  if (candidates.length === 0) return results;
 
   let aliasMap: Map<string, Array<{ slug: string; source_id: string }>>;
   try {
-    aliasMap = await engine.resolveAliases([qNorm], opts);
+    aliasMap = await engine.resolveAliases(candidates, opts);
   } catch {
     return results; // pre-v110 table-missing OR transient error -> fail-open
   }
-  const refs = aliasMap.get(qNorm);
+  const exactRefs = candidates[0] === qNorm ? aliasMap.get(qNorm) : undefined;
+  // Exact aliases retain collision behavior. Qualified aliases are stricter:
+  // take the longest/leftmost phrase that resolves to one canonical page.
+  const refs = exactRefs?.length
+    ? exactRefs
+    : candidates.slice(candidates[0] === qNorm ? 1 : 0)
+        .map(norm => aliasMap.get(norm))
+        .find(hits => hits?.length === 1);
   if (!refs || refs.length === 0) return results;
 
   // Deterministic + capped. Source-scoped: each canonical is a (source_id, slug)

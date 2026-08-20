@@ -8,8 +8,9 @@
  * whether a query is a title-phrase match for a page.
  *
  * Guard rails (Codex#10 — avoid promoting generic pages on stopword-y queries):
- *   - require >= MIN_CONTENT_TOKENS non-stopword tokens in the query, OR an
- *     exact normalized full-title match (so a deliberate 1-word title still hits);
+ *   - require >= MIN_CONTENT_TOKENS non-stopword tokens in the contained
+ *     phrase (query or title), OR an exact normalized full-title match (so a
+ *     deliberate 1-word title still hits);
  *   - match at TOKEN BOUNDARIES (contiguous token run), never raw substring, so
  *     "art" doesn't match "Bartholomew";
  *   - stopwords ("the", "a", "of", …) don't count toward the content-token floor.
@@ -66,7 +67,9 @@ function containsTokenRun(haystack: string[], needle: string[]): boolean {
  * Returns true when EITHER:
  *   (a) the normalized query token sequence is a contiguous run inside the
  *       normalized title AND the query has >= MIN_CONTENT_TOKENS content tokens; OR
- *   (b) the normalized query equals the full normalized title exactly (covers
+ *   (b) the normalized title token sequence is a contiguous run inside the
+ *       normalized query AND the title has >= MIN_CONTENT_TOKENS content tokens; OR
+ *   (c) the normalized query equals the full normalized title exactly (covers
  *       deliberate single-word titles / chosen names like "Mingtang").
  *
  * Order-insensitive matching is intentionally NOT done — a title-phrase signal
@@ -78,15 +81,23 @@ export function isTitlePhraseMatch(query: string, title: string): boolean {
   const tTokens = tokenizeTitle(title);
   if (qTokens.length === 0 || tTokens.length === 0) return false;
 
-  // (b) exact full-title match (covers 1-word chosen names).
+  // (c) exact full-title match (covers 1-word chosen names).
   if (qTokens.length === tTokens.length && qTokens.every((t, i) => t === tTokens[i])) {
     return true;
   }
 
-  // (a) contiguous phrase match, gated by content-token floor.
+  // (a) query phrase inside title, gated by content-token floor.
   const qContent = contentTokens(qTokens);
-  if (qContent.length < MIN_CONTENT_TOKENS) return false;
-  return containsTokenRun(tTokens, qTokens);
+  if (qContent.length >= MIN_CONTENT_TOKENS && containsTokenRun(tTokens, qTokens)) {
+    return true;
+  }
+
+  // (b) named title inside a longer, qualified query. This is the common
+  // agent shape ("Trevor Goertzen meetings", "renewal risk enrollment
+  // decline") that the original one-way matcher missed. The same two-content-
+  // token floor prevents generic one-word titles from gaining authority.
+  const tContent = contentTokens(tTokens);
+  return tContent.length >= MIN_CONTENT_TOKENS && containsTokenRun(qTokens, tTokens);
 }
 
 // Exported for unit tests.
