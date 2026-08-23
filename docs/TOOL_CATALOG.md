@@ -190,7 +190,7 @@ Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `cache_stats` | Semantic query-cache introspection: resolved knobs (enabled, similarity threshold, TTL) plus row counts and total hits. | admin |  |  |
-| `query` | Hybrid search with vector + keyword + multi-query expansion. | read | yes |  |
+| `query` | Hybrid search with vector + keyword and optional multi-query expansion (explicit expand flag, then brain config, then search-mode default). | read | yes |  |
 | `search` | Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. | read | yes |  |
 | `search_by_image` | v0.36 cross-modal Phase 2: image-as-query retrieval. | read |  |  |
 | `search_modes` | Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with attribution (mode default vs config override), the three frozen bundles, and a reranker_readiness verdict (whether the resolved reranker will actually run; remote callers get the verdict without the host key inventory). | read |  |  |
