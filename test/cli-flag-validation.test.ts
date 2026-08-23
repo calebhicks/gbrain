@@ -107,6 +107,10 @@ describe('#2185 acceptance — real usage stays legal', () => {
     expect(validateCommandFlags('sync', ['--full'])).toBeNull();
   });
 
+  test('dream accepts the nightly CycleReport file flag from the generated registry', () => {
+    expect(validateCommandFlags('dream', ['--source', 'default', '--json-out', '/tmp/x'])).toBeNull();
+  });
+
   test('scope flags require direct consumption on upgrade surfaces', () => {
     expect(validateCommandFlags('reindex', ['--markdown', '--type', 'atom'])).toBeNull();
     expect(validateCommandFlags('upgrade', ['--type', 'atom'])).toBe('--type');
