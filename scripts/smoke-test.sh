@@ -28,6 +28,74 @@ fail()    { TOTAL=$((TOTAL + 1)); FAILURES=$((FAILURES + 1)); echo "❌ $1"; ech
 fixed()   { FIXES=$((FIXES + 1)); echo "🔧 Fixed: $1"; echo "$(timestamp) FIXED: $1" >> "$LOG"; }
 skip()    { SKIPPED=$((SKIPPED + 1)); echo "⏭️  $1"; echo "$(timestamp) SKIP: $1" >> "$LOG"; }
 
+# GNU coreutils is not part of macOS. Keep the smoke path self-contained while
+# still bounding every gbrain call. The Perl parent retains an unreaped child
+# relationship until completion, so the PID cannot be recycled before a
+# timeout signal; only the child started here can be signalled.
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  local perl_bin
+  perl_bin="$(command -v perl 2>/dev/null || true)"
+  if [ -n "$perl_bin" ]; then
+    "$perl_bin" -MPOSIX=:sys_wait_h -e '
+    my $seconds = shift @ARGV;
+    my $pid = fork();
+    exit 125 unless defined $pid;
+    if ($pid == 0) { exec @ARGV; exit 127; }
+    my $deadline = time() + $seconds;
+    while (1) {
+      my $waited = waitpid($pid, WNOHANG);
+      if ($waited == $pid) {
+        my $status = $?;
+        exit WEXITSTATUS($status) if WIFEXITED($status);
+        exit 128 + WTERMSIG($status) if WIFSIGNALED($status);
+        exit 125;
+      }
+      if (time() >= $deadline) {
+        kill "TERM", $pid;
+        for (1..20) {
+          exit 124 if waitpid($pid, WNOHANG) == $pid;
+          select undef, undef, undef, 0.1;
+        }
+        kill "KILL", $pid;
+        waitpid($pid, 0);
+        exit 124;
+      }
+      select undef, undef, undef, 0.05;
+    }
+    ' "$seconds" "$@"
+    return $?
+  fi
+
+  # Minimal-host fallback (Alpine/NixOS may omit Perl). The shell retains the
+  # background child as an unreaped job while polling, so its PID cannot be
+  # recycled before TERM/KILL. Keep this branch dependency-free.
+  "$@" &
+  local child_pid=$!
+  local deadline=$((SECONDS + seconds))
+  local child_rc
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      kill -TERM "$child_pid" 2>/dev/null || true
+      local attempt=0
+      while [ "$attempt" -lt 2 ] && kill -0 "$child_pid" 2>/dev/null; do
+        sleep 1
+        attempt=$((attempt + 1))
+      done
+      if kill -0 "$child_pid" 2>/dev/null; then
+        kill -KILL "$child_pid" 2>/dev/null || true
+      fi
+      wait "$child_pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+  done
+  wait "$child_pid"
+  child_rc=$?
+  return "$child_rc"
+}
+
 echo "$(timestamp) === GBrain Smoke Tests ===" >> "$LOG"
 echo "🧪 Running gbrain smoke tests..."
 echo ""
@@ -75,12 +143,12 @@ fi
 
 # ── 2. GBrain CLI loads ────────────────────────────────────
 if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
-  if timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+  if run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
     pass "GBrain CLI ($GBRAIN_DIR)"
   else
     # Auto-fix: reinstall deps
     cd "$GBRAIN_DIR" && "$BUN_PATH" install --frozen-lockfile 2>/dev/null
-    if timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+    if run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
       fixed "GBrain deps reinstalled"
       pass "GBrain CLI (after dep fix)"
     else
@@ -99,7 +167,7 @@ fi
 # works with the DB down), then branch on doctor --json's connection check,
 # with `gbrain db-repair --yes` as the auto-fix arm.
 if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
-  ENGINE_JSON=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" engine status --json 2>/dev/null)
+  ENGINE_JSON=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" engine status --json 2>/dev/null)
   # #4182: BSD grep (macOS) has no -P; keep this shipped smoke test POSIX-portable.
   ENGINE_KIND=$(printf '%s\n' "$ENGINE_JSON" | sed -n 's/.*"effective_engine": *"\([a-z]*\)".*/\1/p' | head -1)
   ENGINE_SRC=$(printf '%s\n' "$ENGINE_JSON" | sed -n 's/.*"db_url_source": *"\([^"]*\)".*/\1/p' | head -1)
@@ -107,7 +175,7 @@ if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
   if [ -z "$DB_URL" ] && [ "$ENGINE_KIND" != "pglite" ]; then
     fail "GBrain database — no DATABASE_URL or GBRAIN_DATABASE_URL (and the engine is not pglite)"
   else
-    run_doctor_json() { DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 30 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor --json 2>/dev/null; }
+    run_doctor_json() { DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" run_with_timeout 30 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor --json 2>/dev/null; }
     DOCTOR_JSON=$(run_doctor_json)
     CONN_STATUS=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"name": *"connection", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
     if [ "$CONN_STATUS" = "ok" ]; then
@@ -119,7 +187,7 @@ if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
       # 240s: the docker conn_refused arm's readiness poll alone can run
       # ~165s worst-case; a 60s cap would SIGTERM the repair mid-poll and
       # report failure while the container it just started is still warming.
-      DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 240 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" db-repair --yes >> "$LOG" 2>&1
+      DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" run_with_timeout 240 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" db-repair --yes >> "$LOG" 2>&1
       DOCTOR_JSON=$(run_doctor_json)
       CONN_STATUS=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"name": *"connection", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
       if [ "$CONN_STATUS" = "ok" ]; then
@@ -138,10 +206,13 @@ fi
 if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ] && [ -n "$DB_URL" ]; then
   SUPERVISOR_RUNNING=0
   LEGACY_WORKER_RUNNING=0
-  if DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" \
-      timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json >/dev/null 2>&1; then
-    SUPERVISOR_RUNNING=1
-  fi
+  # Parse the typed payload — the CLI exits 0 with {"running":false} when no
+  # supervisor is live, so exit status alone must never count as liveness.
+  SUPERVISOR_JSON=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" \
+      run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json 2>/dev/null)
+  case "$SUPERVISOR_JSON" in
+    *'"running":true'*|*'"running": true'*) SUPERVISOR_RUNNING=1 ;;
+  esac
   if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
     LEGACY_WORKER_RUNNING=1
   fi
