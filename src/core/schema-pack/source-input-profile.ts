@@ -188,17 +188,28 @@ export function prepareAtomSource(
   const selected = selectHeadingSection(content, resolved.profile);
   const { max_chars: maxChars, overlap_chars: overlapChars } = resolved.profile.windowing;
   const windows: AtomSourceWindow[] = [];
+  const sourceSectionSha256 = sha256(selected.text);
   let start = 0;
   while (start < selected.text.length) {
     const end = windowEnd(selected.text, start, maxChars);
     const text = selected.text.slice(start, end);
-    const evidenceAnchors = [...text.matchAll(EVIDENCE_ANCHOR_RE)].map(match => match[1]);
+    const windowSha256 = sha256(text);
+    const virtualWindowAnchor = `evidence-window-${sha256(JSON.stringify({
+      source_section_sha256: sourceSectionSha256,
+      start,
+      end,
+      window_sha256: windowSha256,
+    })).slice(0, 16)}`;
+    const evidenceAnchors = [
+      ...text.matchAll(EVIDENCE_ANCHOR_RE),
+    ].map(match => match[1]);
+    evidenceAnchors.push(virtualWindowAnchor);
     windows.push({
       index: windows.length,
       start,
       end,
       text,
-      sha256: sha256(text),
+      sha256: windowSha256,
       evidence_anchors: [...new Set(evidenceAnchors)],
     });
     if (end === selected.text.length) break;
@@ -223,7 +234,7 @@ export function prepareAtomSource(
   }));
   return {
     selected_source: selected.text,
-    source_section_sha256: sha256(selected.text),
+    source_section_sha256: sourceSectionSha256,
     source_start: selected.start,
     source_end: selected.end,
     windows,

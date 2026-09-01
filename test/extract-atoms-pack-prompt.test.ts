@@ -159,6 +159,8 @@ describe('pack-owned extract_atoms prompt', () => {
     expect(prepared.selected_source).not.toContain('SYNTHESIS_MUST_NOT_ENTER_EXTRACTION');
     expect(prepared.selected_source).toContain('UNIQUE_TAIL_COUNTEREXAMPLE');
     expect(prepared.evidence_anchors).toContain('evidence-tail');
+    expect(prepared.windows.every(window => window.evidence_anchors.some(anchor => /^evidence-window-[a-f0-9]{16}$/u.test(anchor)))).toBe(true);
+    expect(new Set(prepared.windows.flatMap(window => window.evidence_anchors.filter(anchor => anchor.startsWith('evidence-window-')))).size).toBe(prepared.windows.length);
     let covered = 0;
     for (const window of prepared.windows) {
       expect(window.start).toBeLessThanOrEqual(covered);
