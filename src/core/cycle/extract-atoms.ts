@@ -262,7 +262,8 @@ quote, or short essay angle. Each atom must:
   - Have a clear point (not just descriptive)
   - Be specific (not a generic platitude)
 
-Output a JSON array of atoms (1-3 per transcript, never more than 3).
+Output a JSON array of atoms. Obey any supplied per-window or parent limit;
+when no explicit limit is supplied, return 1-3 atoms and never more than 3.
 Each atom: {title (≤80 chars), atom_type, body (2-4 sentences),
 source_quote (verbatim ≤200 chars), lesson (one sentence), concepts
 (1-3 topic labels), virality_score (0-100), emotional_register (one of:
@@ -749,6 +750,7 @@ export async function runPhaseExtractAtoms(
   let maxInputChars = DEFAULT_EXTRACT_MAX_INPUT_CHARS;
   let maxOutputTokens = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS;
   let pacingMs = 0;
+  let extractionConcurrency = 1;
   try {
     extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
@@ -775,6 +777,11 @@ export async function runPhaseExtractAtoms(
     if (configuredPacing) {
       const n = Number(configuredPacing);
       if (Number.isFinite(n) && n > 0) pacingMs = Math.min(60_000, Math.floor(n));
+    }
+    const configuredConcurrency = await engine.getConfig('cycle.extract_atoms.concurrency');
+    if (configuredConcurrency) {
+      const n = Number(configuredConcurrency);
+      if (Number.isFinite(n) && n >= 1) extractionConcurrency = Math.min(128, Math.floor(n));
     }
   } catch {
     // Keep key-aware utility model and safe extraction defaults.
@@ -952,6 +959,7 @@ export async function runPhaseExtractAtoms(
         failures: [],
         estimated_spend_usd: 0,
         budget_usd: DEFAULT_BUDGET_USD,
+        extraction_concurrency: extractionConcurrency,
         dry_run: opts.dryRun ?? false,
       },
     };
@@ -1158,7 +1166,13 @@ export async function runPhaseExtractAtoms(
   }
 
   await withBudgetTracker(budgetTracker, async () => {
-  for (const item of work) {
+  let nextWorkIndex = 0;
+  async function runWorker(): Promise<void> {
+  for (;;) {
+    if (abortedGlobalError) return;
+    const workIndex = nextWorkIndex++;
+    if (workIndex >= work.length) return;
+    const item = work[workIndex]!;
     await maybeYield();
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1436,6 +1450,10 @@ export async function runPhaseExtractAtoms(
       });
     }
   }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(extractionConcurrency, work.length) }, () => runWorker()),
+  );
   });
   estimatedSpendUsd = budgetTracker.totalSpent;
 
@@ -1514,6 +1532,7 @@ export async function runPhaseExtractAtoms(
       tombstoned_for_failures: tombstonedForFailures,
       estimated_spend_usd: estimatedSpendUsd,
       budget_usd: budgetCap,
+      extraction_concurrency: extractionConcurrency,
       model: extractModel,
       budget_exhausted: budgetExhausted,
       source_id: sourceId,

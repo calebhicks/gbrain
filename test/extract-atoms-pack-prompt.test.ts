@@ -381,6 +381,7 @@ describe('pack-owned extract_atoms prompt', () => {
     });
     expect(result.status).toBe('ok');
     expect(reconciliationSystem).toContain('strongest non-duplicative 1-6 atoms');
+    expect(reconciliationSystem).not.toContain('1-3 per transcript, never more than 3');
     const rows = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>(
       `SELECT frontmatter FROM pages WHERE type='atom' AND deleted_at IS NULL`,
     );
@@ -461,5 +462,46 @@ describe('pack-owned extract_atoms prompt', () => {
     expect(atoms[0].frontmatter.extraction_source_quote_start).toBe(content.indexOf('The buyer will invite'));
     expect(atoms[0].frontmatter.extraction_source_quote_end).toBe(content.length);
     expect(atoms[0].frontmatter.extraction_source_quote_sha256).toMatch(/^[a-f0-9]{64}$/);
+  }, 60_000);
+
+  test('runs source items with an explicit bounded concurrency while preserving exact writes', async () => {
+    const { resolved } = await inheritedPack();
+    await engine.setConfig('cycle.extract_atoms.concurrency', '4');
+    let inFlight = 0;
+    let maximumInFlight = 0;
+    const chat = async (opts: ChatOpts): Promise<ChatResult> => {
+      inFlight++;
+      maximumInFlight = Math.max(maximumInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      const content = String(opts.messages[0]?.content ?? '');
+      const id = content.match(/SOURCE-(\d+)/u)?.[1] ?? 'unknown';
+      inFlight--;
+      return {
+        text: JSON.stringify([{
+          title: `Concurrent atom ${id}`,
+          atom_type: 'insight',
+          body: `Source ${id} completed through bounded concurrency.`,
+        }]),
+        blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic',
+      };
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: Array.from({ length: 8 }, (_, index) => ({
+        slug: `experiences/concurrent-${index}`,
+        pageType: 'experience',
+        content: `SOURCE-${index} ${'e'.repeat(600)}`,
+        contentHash: `concurrent-source-hash-${index}`,
+      })),
+      _chat: chat,
+    });
+    expect(result.status).toBe('ok');
+    expect(maximumInFlight).toBe(4);
+    expect(result.details?.extraction_concurrency).toBe(4);
+    expect(result.details?.pages_processed).toBe(8);
+    const rows = await engine.executeRaw(`SELECT slug FROM pages WHERE type='atom' AND deleted_at IS NULL`);
+    expect(rows).toHaveLength(8);
   }, 60_000);
 });
