@@ -380,8 +380,9 @@ describe('pack-owned extract_atoms prompt', () => {
       _chat: chat,
     });
     expect(result.status).toBe('ok');
-    expect(reconciliationSystem).toContain('strongest non-duplicative 1-6 atoms');
+    expect(reconciliationSystem).toContain('Return at most 6 atoms');
     expect(reconciliationSystem).not.toContain('1-3 per transcript, never more than 3');
+    expect(reconciliationSystem).toContain('Do not rank or collapse the candidates to a top three');
     const rows = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>(
       `SELECT frontmatter FROM pages WHERE type='atom' AND deleted_at IS NULL`,
     );

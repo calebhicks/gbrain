@@ -1096,8 +1096,10 @@ export async function runPhaseExtractAtoms(
     }
     const reconciliationSystem =
       `${item.profile.prompt}\n\nYou are reconciling leads extracted from complete, overlapping windows ` +
-      `of one parent page. Return only the strongest non-duplicative 1-${atomLimits.max_atoms_per_parent} atoms. Preserve literal ` +
-      `chronology and exact evidence_refs from the candidates; do not add evidence or claims.`;
+      `of one parent page. Preserve every independently decision-useful candidate and remove only genuine ` +
+      `semantic or exact-evidence duplicates. Do not rank or collapse the candidates to a top three. ` +
+      `Return at most ${atomLimits.max_atoms_per_parent} atoms. Preserve literal chronology and exact ` +
+      `evidence_refs from the candidates; do not add evidence or claims.`;
     const reconciliation = await callAtoms(
       reconciliationSystem,
       `Parent source: ${originLabel}\n` +
