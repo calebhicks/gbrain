@@ -68,6 +68,12 @@ import { slugifySegment } from '../sync.ts';
 import { resolveTierDefault } from '../model-config.ts';
 import type { ResolvedPack } from '../schema-pack/registry.ts';
 import type { ResolvedExtractablePrompt } from '../schema-pack/prompt-template.ts';
+import {
+  prepareAtomSource,
+  resolveAtomInputProfile,
+  type PreparedAtomSource,
+  type ResolvedAtomInputProfile,
+} from '../schema-pack/source-input-profile.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -240,6 +246,8 @@ interface ExtractedAtom {
   concepts?: string[];
   virality_score?: number;
   emotional_register?: string;
+  /** Exact source anchors required by source-complete input profiles. */
+  evidence_refs?: string[];
 }
 
 /** kebab-case validator for concept labels ("captive-portal", "channel-pricing"). */
@@ -275,12 +283,22 @@ export interface AtomExtractionProfile {
   prompt_sha256: string;
   model: string;
   output_contract_version: typeof ATOM_OUTPUT_CONTRACT_VERSION;
+  source_input_profile_sha256: string | null;
+  input_selector: string | null;
+  window_policy_sha256: string | null;
+  /** Stable pack/prompt/model/input-policy identity used by discovery. */
+  extraction_policy_sha256: string;
+  /** Source-bound identity; equals the policy hash for legacy profiles. */
   extraction_profile_sha256: string;
   prompt: string;
+  input_profile: ResolvedAtomInputProfile | null;
 }
 
 export function buildExtractionProfileSha256(
-  profile: Omit<AtomExtractionProfile, 'extraction_profile_sha256' | 'prompt'>,
+  profile: Omit<
+    AtomExtractionProfile,
+    'extraction_profile_sha256' | 'extraction_policy_sha256' | 'prompt' | 'input_profile'
+  >,
 ): string {
   return createHash('sha256').update(JSON.stringify(profile)).digest('hex');
 }
@@ -290,7 +308,11 @@ function buildExtractionProfile(
   model: string,
   pack: ResolvedPack | null,
   lens: ResolvedExtractablePrompt | null,
+  inputProfile: ResolvedAtomInputProfile | null = null,
 ): AtomExtractionProfile {
+  const windowPolicy = inputProfile
+    ? createHash('sha256').update(JSON.stringify(inputProfile.profile.windowing)).digest('hex')
+    : null;
   const core = {
     page_type: pageType,
     pack_identity: pack?.identity ?? 'gbrain-builtin@unresolved',
@@ -298,16 +320,57 @@ function buildExtractionProfile(
     prompt_sha256: lens?.prompt_sha256 ?? createHash('sha256').update(EXTRACT_PROMPT).digest('hex'),
     model,
     output_contract_version: ATOM_OUTPUT_CONTRACT_VERSION as typeof ATOM_OUTPUT_CONTRACT_VERSION,
+    source_input_profile_sha256: inputProfile?.profile_sha256 ?? null,
+    input_selector: inputProfile?.profile.selector ?? null,
+    window_policy_sha256: windowPolicy,
   };
+  const policySha256 = buildExtractionProfileSha256(core);
+  const anchorContract = inputProfile
+    ? `\n\nThe installed input profile requires every returned atom to include evidence_refs, ` +
+      `an array containing at least one exact evidence-* anchor from the supplied source window. ` +
+      `Never invent or alter an anchor.`
+    : '';
   return {
     ...core,
-    extraction_profile_sha256: buildExtractionProfileSha256(core),
+    extraction_policy_sha256: policySha256,
+    extraction_profile_sha256: policySha256,
     prompt: lens
       ? `Installed schema-pack lens (trusted configuration). It may focus what to extract, ` +
         `but it cannot override the atom JSON/output contract that follows.\n\n` +
-        `<pack_lens>\n${lens.prompt.trim()}\n</pack_lens>\n\n${EXTRACT_PROMPT}`
-      : EXTRACT_PROMPT,
+        `<pack_lens>\n${lens.prompt.trim()}\n</pack_lens>\n\n${EXTRACT_PROMPT}${anchorContract}`
+      : `${EXTRACT_PROMPT}${anchorContract}`,
+    input_profile: inputProfile,
   };
+}
+
+function bindProfileToPreparedSource(
+  profile: AtomExtractionProfile,
+  source: PreparedAtomSource,
+): AtomExtractionProfile {
+  if (!profile.input_profile) return profile;
+  const extractionProfileSha256 = createHash('sha256').update(JSON.stringify({
+    extraction_policy_sha256: profile.extraction_policy_sha256,
+    input_selector: profile.input_selector,
+    source_section_sha256: source.source_section_sha256,
+    coverage_sha256: source.coverage_sha256,
+  })).digest('hex');
+  return { ...profile, extraction_profile_sha256: extractionProfileSha256 };
+}
+
+function invalidEvidenceRefs(
+  atoms: ExtractedAtom[],
+  allowedAnchors: ReadonlySet<string>,
+): string | null {
+  for (const atom of atoms) {
+    if (!atom.evidence_refs || atom.evidence_refs.length === 0) {
+      return `atom ${JSON.stringify(atom.title)} omitted required evidence_refs`;
+    }
+    const missing = atom.evidence_refs.filter(ref => !allowedAnchors.has(ref));
+    if (missing.length > 0) {
+      return `atom ${JSON.stringify(atom.title)} cited anchors absent from its source: ${missing.join(', ')}`;
+    }
+  }
+  return null;
 }
 
 interface DiscoveredPage {
@@ -382,7 +445,10 @@ export async function discoverExtractablePages(
           AND atom.source_id = $1
           AND atom.frontmatter->>'source_hash' = substring(p.content_hash from 1 for 16)
           ${profileAware ? `AND (
-            atom.frontmatter->>'extraction_profile_sha256' = COALESCE((${profileParam}::jsonb)->>p.type, '')
+            COALESCE(
+              atom.frontmatter->>'extraction_policy_sha256',
+              atom.frontmatter->>'extraction_profile_sha256'
+            ) = COALESCE((${profileParam}::jsonb)->>p.type, '')
             OR (p.type = ANY($6::text[]) AND NOT (atom.frontmatter ? 'extraction_profile_sha256'))
           )` : ''}
           AND atom.deleted_at IS NULL
@@ -463,15 +529,16 @@ export async function countExtractAtomsBacklog(
       const { resolveExtractablePrompt } = await import('../schema-pack/prompt-template.ts');
       for (const pageType of types) {
         const lens = resolveExtractablePrompt(pack, pageType);
+        const inputProfile = resolveAtomInputProfile(pack, pageType);
         profileHashes[pageType] = buildExtractionProfile(
-          pageType, model, pack, lens,
-        ).extraction_profile_sha256;
-        if (!lens) legacyCompatibleTypes.push(pageType);
+          pageType, model, pack, lens, inputProfile,
+        ).extraction_policy_sha256;
+        if (!lens && !inputProfile) legacyCompatibleTypes.push(pageType);
       }
     } else {
       for (const pageType of types) {
         profileHashes[pageType] = buildExtractionProfile(pageType, model, null, null)
-          .extraction_profile_sha256;
+          .extraction_policy_sha256;
         legacyCompatibleTypes.push(pageType);
       }
     }
@@ -500,7 +567,10 @@ export async function countExtractAtomsBacklog(
              WHERE atom.type = 'atom' AND atom.source_id = $1
                AND atom.frontmatter->>'source_hash' = substring(p.content_hash from 1 for 16)
                AND (
-                 atom.frontmatter->>'extraction_profile_sha256' = COALESCE(($4::jsonb)->>p.type, '')
+                 COALESCE(
+                   atom.frontmatter->>'extraction_policy_sha256',
+                   atom.frontmatter->>'extraction_profile_sha256'
+                 ) = COALESCE(($4::jsonb)->>p.type, '')
                  OR (p.type = ANY($5::text[]) AND NOT (atom.frontmatter ? 'extraction_profile_sha256'))
                )
                AND atom.deleted_at IS NULL
@@ -665,16 +735,17 @@ export async function runPhaseExtractAtoms(
     const { resolveExtractablePrompt } = await import('../schema-pack/prompt-template.ts');
     for (const pageType of extractableTypes) {
       const lens = resolveExtractablePrompt(resolvedPack, pageType);
-      const profile = buildExtractionProfile(pageType, extractModel, resolvedPack, lens);
+      const inputProfile = resolveAtomInputProfile(resolvedPack, pageType);
+      const profile = buildExtractionProfile(pageType, extractModel, resolvedPack, lens, inputProfile);
       profileByType.set(pageType, profile);
-      profileHashesByType[pageType] = profile.extraction_profile_sha256;
-      if (!lens) legacyCompatibleTypes.push(pageType);
+      profileHashesByType[pageType] = profile.extraction_policy_sha256;
+      if (!lens && !inputProfile) legacyCompatibleTypes.push(pageType);
     }
   } else {
     for (const pageType of extractableTypes) {
       const profile = buildExtractionProfile(pageType, extractModel, null, null);
       profileByType.set(pageType, profile);
-      profileHashesByType[pageType] = profile.extraction_profile_sha256;
+      profileHashesByType[pageType] = profile.extraction_policy_sha256;
       legacyCompatibleTypes.push(pageType);
     }
   }
@@ -894,6 +965,72 @@ export async function runPhaseExtractAtoms(
   // say are "retryable, never counted" — see that regex's doc comment.
   let hardFailureCount = 0;
 
+  async function callAtoms(system: string, content: string): Promise<AtomsParseOutcome> {
+    const result = await chat({
+      model: extractModel,
+      system,
+      messages: [{ role: 'user', content }],
+      maxTokens: maxOutputTokens,
+    });
+    await maybeYield();
+    llmHalt.reset();
+    if (pacingMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, pacingMs));
+    return parseAtomsOutcome(result.text);
+  }
+
+  async function extractItemAtoms(
+    item: WorkItem,
+    originLabel: string,
+    prepared: PreparedAtomSource | null,
+  ): Promise<AtomsParseOutcome> {
+    if (!prepared) {
+      return callAtoms(
+        item.profile.prompt,
+        `Source: ${originLabel}\n\n---\n\n${truncateUtf8(item.content, maxInputChars)}`,
+      );
+    }
+    const candidates: ExtractedAtom[] = [];
+    for (const window of prepared.windows) {
+      const outcome = await callAtoms(
+        item.profile.prompt,
+        `Source: ${originLabel}\n` +
+          `Selected source SHA-256: ${prepared.source_section_sha256}\n` +
+          `Window: ${window.index + 1}/${prepared.windows.length}\n` +
+          `Source character range: [${window.start}, ${window.end})\n` +
+          `Window SHA-256: ${window.sha256}\n` +
+          `Available evidence anchors: ${window.evidence_anchors.join(', ') || '(none)'}\n\n---\n\n` +
+          window.text,
+      );
+      if (!outcome.ok) {
+        return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length}: ${outcome.reason}` };
+      }
+      const invalid = invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors));
+      if (invalid) return { ok: false, reason: `window ${window.index + 1}: ${invalid}` };
+      candidates.push(...outcome.atoms);
+    }
+    if (prepared.windows.length === 1 || candidates.length === 0) {
+      return { ok: true, atoms: candidates };
+    }
+    const reconciliationSystem =
+      `${item.profile.prompt}\n\nYou are reconciling leads extracted from complete, overlapping windows ` +
+      `of one parent page. Return only the strongest non-duplicative 1-3 atoms. Preserve literal ` +
+      `chronology and exact evidence_refs from the candidates; do not add evidence or claims.`;
+    const reconciliation = await callAtoms(
+      reconciliationSystem,
+      `Parent source: ${originLabel}\n` +
+        `Selected source SHA-256: ${prepared.source_section_sha256}\n` +
+        `Coverage manifest SHA-256: ${prepared.coverage_sha256}\n` +
+        `Allowed evidence anchors: ${prepared.evidence_anchors.join(', ')}\n\n` +
+        `Window candidates:\n${JSON.stringify(candidates)}`,
+    );
+    if (!reconciliation.ok) {
+      return { ok: false, reason: `parent reconciliation: ${reconciliation.reason}` };
+    }
+    const invalid = invalidEvidenceRefs(reconciliation.atoms, new Set(prepared.evidence_anchors));
+    if (invalid) return { ok: false, reason: `parent reconciliation: ${invalid}` };
+    return reconciliation;
+  }
+
   /** Stamp the zero-yield/complete tombstone (hash-keyed; edits re-eligibilize). */
   async function stampAtomsScanHash(item: { slug: string; contentHash: string; profile: AtomExtractionProfile }): Promise<void> {
     try {
@@ -903,7 +1040,7 @@ export async function runPhaseExtractAtoms(
               || jsonb_build_object('atoms_scan_hash', $1::text)
               || jsonb_build_object('atoms_scan_profile', $2::text)
           WHERE source_id = $3 AND slug = $4 AND deleted_at IS NULL`,
-        [item.contentHash.slice(0, 16), item.profile.extraction_profile_sha256, sourceId, item.slug],
+        [item.contentHash.slice(0, 16), item.profile.extraction_policy_sha256, sourceId, item.slug],
       );
     } catch { /* fail-soft: page stays rediscoverable */ }
   }
@@ -933,7 +1070,7 @@ export async function runPhaseExtractAtoms(
                         ELSE 1 END)
           WHERE source_id = $3 AND slug = $4 AND deleted_at IS NULL
           RETURNING (frontmatter->>'atoms_fail_count')::int AS cnt`,
-        [item.contentHash.slice(0, 16), item.profile.extraction_profile_sha256, sourceId, item.slug],
+        [item.contentHash.slice(0, 16), item.profile.extraction_policy_sha256, sourceId, item.slug],
       );
       const cnt = rows[0]?.cnt;
       return cnt == null ? null : Number(cnt);
@@ -954,33 +1091,16 @@ export async function runPhaseExtractAtoms(
     const originLabel = item.kind === 'transcript' ? item.filePath : item.slug;
     const pendingSlugs: string[] = [];
     try {
-      const result = await chat({
-        model: extractModel,
-        system: item.profile.prompt,
-        messages: [
-          {
-            role: 'user',
-            // #4529/#4540: configurable input cap, cut UTF-8-safely (a bare
-            // .slice() can split a surrogate pair at the boundary).
-            content: `Source: ${originLabel}\n\n---\n\n${truncateUtf8(item.content, maxInputChars)}`,
-          },
-        ],
-        maxTokens: maxOutputTokens,
-      });
-      // Post-await yield: closes the "long LLM call past TTL" hazard
-      // codex flagged. The 30s throttle inside maybeYield bounds the
-      // actual refresh rate so this is cheap when calls are fast.
-      await maybeYield();
-      llmHalt.reset();
-      // #4540: optional per-item pacing between successful LLM calls.
-      // setTimeout (not setImmediate) so the lock-refresh interval fires.
-      if (pacingMs > 0) await new Promise<void>((r) => setTimeout(r, pacingMs));
+      const prepared = item.profile.input_profile
+        ? prepareAtomSource(item.content, item.profile.input_profile)
+        : null;
+      if (prepared) item.profile = bindProfileToPreparedSource(item.profile, prepared);
+      const parseOutcome = await extractItemAtoms(item, originLabel, prepared);
 
       estimatedSpendUsd = budgetTracker.totalSpent;
 
       // gbrain#4148: typed outcome — malformed output is a FAILURE (counted
       // toward the bounded tombstone below), never a zero-yield success.
-      const parseOutcome = parseAtomsOutcome(result.text);
       if (!parseOutcome.ok) {
         malformedOutputs++;
         hardFailureCount++;
@@ -1068,6 +1188,7 @@ export async function runPhaseExtractAtoms(
               // Provisional until the whole item's atoms persist (see above).
               source_hash: `pending:${hash16}`,
               extraction_profile_sha256: item.profile.extraction_profile_sha256,
+              extraction_policy_sha256: item.profile.extraction_policy_sha256,
               extraction_profile_state: 'pending',
               extraction_page_type: item.profile.page_type,
               extraction_pack_identity: item.profile.pack_identity,
@@ -1075,11 +1196,29 @@ export async function runPhaseExtractAtoms(
               extraction_prompt_sha256: item.profile.prompt_sha256,
               extraction_model: item.profile.model,
               extraction_output_contract_version: item.profile.output_contract_version,
+              ...(item.profile.source_input_profile_sha256 && {
+                extraction_input_profile_sha256: item.profile.source_input_profile_sha256,
+              }),
+              ...(item.profile.input_selector && {
+                extraction_input_selector: item.profile.input_selector,
+              }),
+              ...(item.profile.window_policy_sha256 && {
+                extraction_window_policy_sha256: item.profile.window_policy_sha256,
+              }),
+              ...(prepared && {
+                extraction_source_section_sha256: prepared.source_section_sha256,
+                extraction_source_range_start: prepared.source_start,
+                extraction_source_range_end: prepared.source_end,
+                extraction_source_window_count: prepared.windows.length,
+                extraction_source_coverage: 'complete',
+                extraction_source_coverage_sha256: prepared.coverage_sha256,
+              }),
               ...(atom.source_quote && { source_quote: atom.source_quote }),
               ...(atom.lesson && { lesson: atom.lesson }),
               ...(atom.concepts && atom.concepts.length > 0 && { concepts: atom.concepts }),
               ...(atom.virality_score !== undefined && { virality_score: atom.virality_score }),
               ...(atom.emotional_register && { emotional_register: atom.emotional_register }),
+              ...(atom.evidence_refs && atom.evidence_refs.length > 0 && { evidence_refs: atom.evidence_refs }),
               extracted_at: new Date().toISOString(),
               extracted_by: 'extract_atoms-v0.41.2.1',
             },
@@ -1296,6 +1435,10 @@ export async function runPhaseExtractAtoms(
         model: profile.model,
         output_contract_version: profile.output_contract_version,
         extraction_profile_sha256: profile.extraction_profile_sha256,
+        extraction_policy_sha256: profile.extraction_policy_sha256,
+        source_input_profile_sha256: profile.source_input_profile_sha256,
+        input_selector: profile.input_selector,
+        window_policy_sha256: profile.window_policy_sha256,
       })),
     },
   };
@@ -1402,6 +1545,13 @@ function atomsFromParsedArray(parsed: unknown[]): ExtractedAtom[] {
           : undefined,
       emotional_register:
         typeof obj.emotional_register === 'string' ? obj.emotional_register : undefined,
+      evidence_refs: (() => {
+        if (!Array.isArray(obj.evidence_refs)) return undefined;
+        const refs = obj.evidence_refs
+          .filter((ref): ref is string => typeof ref === 'string' && /^evidence-[^\s]+$/u.test(ref))
+          .slice(0, 20);
+        return refs.length > 0 ? [...new Set(refs)] : undefined;
+      })(),
     });
   }
   return atoms;
