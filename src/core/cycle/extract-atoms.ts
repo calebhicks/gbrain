@@ -67,6 +67,7 @@ import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
 import { resolveTierDefault } from '../model-config.ts';
 import type { ResolvedPack } from '../schema-pack/registry.ts';
+import { getExtractableSpec } from '../schema-pack/extractable.ts';
 import type { ResolvedExtractablePrompt } from '../schema-pack/prompt-template.ts';
 import {
   prepareAtomSource,
@@ -286,6 +287,8 @@ export interface AtomExtractionProfile {
   source_input_profile_sha256: string | null;
   input_selector: string | null;
   window_policy_sha256: string | null;
+  /** Pack-declared typed relationship for source-page → atom provenance. */
+  provenance_link_type: string | null;
   /** Stable pack/prompt/model/input-policy identity used by discovery. */
   extraction_policy_sha256: string;
   /** Source-bound identity; equals the policy hash for legacy profiles. */
@@ -323,7 +326,13 @@ function buildExtractionProfile(
     source_input_profile_sha256: inputProfile?.profile_sha256 ?? null,
     input_selector: inputProfile?.profile.selector ?? null,
     window_policy_sha256: windowPolicy,
+    provenance_link_type: pack
+      ? (getExtractableSpec(pack.manifest, pageType)?.provenance_link_type ?? null)
+      : null,
   };
+  if (core.provenance_link_type && !pack!.manifest.link_types.some(link => link.name === core.provenance_link_type)) {
+    throw new Error(`extractable provenance_link_type '${core.provenance_link_type}' is not declared by schema pack ${pack!.manifest.name}`);
+  }
   const policySha256 = buildExtractionProfileSha256(core);
   const anchorContract = inputProfile
     ? `\n\nThe installed input profile requires every returned atom to include evidence_refs, ` +
@@ -1297,6 +1306,7 @@ export async function runPhaseExtractAtoms(
             provenanceLinks.push({
               from_slug: item.slug,
               to_slug: slug,
+              ...(item.profile.provenance_link_type && { link_type: item.profile.provenance_link_type }),
               link_source: 'atom-provenance',
               from_source_id: sourceId,
               to_source_id: sourceId,

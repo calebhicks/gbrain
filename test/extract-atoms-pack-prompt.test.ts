@@ -36,13 +36,20 @@ afterEach(() => {
   while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
-function manifest(name: string, version: string, extendsName: string | null, pageTypes: unknown[]): SchemaPackManifest {
+function manifest(
+  name: string,
+  version: string,
+  extendsName: string | null,
+  pageTypes: unknown[],
+  linkTypes: unknown[] = [],
+): SchemaPackManifest {
   return SchemaPackManifestSchema.parse({
     api_version: 'gbrain-schema-pack-v1',
     name,
     version,
     extends: extendsName,
     page_types: pageTypes,
+    link_types: linkTypes,
   });
 }
 
@@ -51,6 +58,7 @@ async function inheritedPack(
   prompt = 'Find bounded visible change.',
   childVersion = '1.0.0',
   inputProfile?: unknown,
+  provenanceLinkType?: string,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'gbrain-pack-prompt-'));
   roots.push(root);
@@ -78,8 +86,9 @@ async function inheritedPack(
         ? { input_profile: 'input-profiles/complete-source.json' }
         : {}),
       eval_dimensions: ['source-closure'],
+      ...(provenanceLinkType ? { provenance_link_type: provenanceLinkType } : {}),
     },
-  }]);
+  }], provenanceLinkType ? [{ name: provenanceLinkType, inverse: 'source-supports-atom' }] : []);
   const child = manifest('child-pack', childVersion, 'parent-pack', []);
   const byName = new Map([[parent.name, parent], [child.name, child]]);
   const paths = new Map([[parent.name, parentPath], [child.name, childPath]]);
@@ -186,6 +195,36 @@ describe('pack-owned extract_atoms prompt', () => {
       expect(rows[0].frontmatter.extraction_profile_sha256).toMatch(/^[a-f0-9]{64}$/);
       expect(rows[0].frontmatter.extraction_declaring_pack).toBe('parent-pack');
     expect(rows[0].frontmatter.extraction_profile_state).toBe('active');
+  }, 60_000);
+
+  test('materializes the schema-pack provenance relationship type on native atom edges', async () => {
+    const { resolved } = await inheritedPack(
+      'prompts/experience.md',
+      'Find bounded visible change.',
+      '1.0.0',
+      undefined,
+      'derived-from-source',
+    );
+    await engine.putPage('experiences/typed', {
+      type: 'experience' as never,
+      title: 'Typed source',
+      compiled_truth: 'A complete source body.',
+      timeline: '',
+    });
+    await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: [{ slug: 'experiences/typed', pageType: 'experience', content: 'A complete source body.', contentHash: 'typed-source-hash' }],
+      _chat: async (): Promise<ChatResult> => ({
+        text: '[{"title":"Typed provenance","atom_type":"insight","body":"The evidence stays traceable."}]',
+        blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic',
+      }),
+    });
+    const links = await engine.getLinks('experiences/typed');
+    expect(links).toHaveLength(1);
+    expect(links[0]?.link_type).toBe('derived-from-source');
+    expect(links[0]?.link_source).toBe('atom-provenance');
   }, 60_000);
 
   test('a changed prompt profile re-extracts and supersedes only after the replacement is complete', async () => {

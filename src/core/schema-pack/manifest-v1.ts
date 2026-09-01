@@ -76,6 +76,9 @@ const ExtractableSpecSchema = z.object({
   /** Optional recall floor for `gbrain extract benchmark` CI gate.
    * Defaults to 0.8 at consume site when omitted. */
   benchmark_min_recall: z.number().min(0).max(1).optional(),
+  /** Optional schema-pack link type for the native source-page → atom edge.
+   * When absent, extract_atoms preserves the legacy untyped provenance edge. */
+  provenance_link_type: z.string().regex(/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/).optional(),
   /** RESERVED for a follow-up release: relative path to pack-shipped verifier
    * code. Validated as relative + within-pack at parse; REFUSES at runtime
    * in v0.41.23 with paste-ready hint. */
