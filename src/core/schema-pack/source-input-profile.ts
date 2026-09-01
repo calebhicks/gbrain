@@ -20,6 +20,10 @@ const AtomInputProfileSchema = z.object({
   }).strict(),
   reconciliation_grain: z.literal('parent_page'),
   evidence_anchor_validation: z.literal('exact_source_anchor_required'),
+  atom_limits: z.object({
+    max_atoms_per_window: z.number().int().min(1).max(12),
+    max_atoms_per_parent: z.number().int().min(1).max(50),
+  }).strict().default({ max_atoms_per_window: 3, max_atoms_per_parent: 3 }),
   /** Pack-owned governance/audit labels. Runtime behavior never branches on
    * these values, but the exact file bytes remain profile-hashed. */
   metadata: z.record(z.string(), z.unknown()).optional(),
@@ -29,6 +33,13 @@ const AtomInputProfileSchema = z.object({
       code: 'custom',
       path: ['windowing', 'overlap_chars'],
       message: 'overlap_chars must be smaller than max_chars',
+    });
+  }
+  if (value.atom_limits.max_atoms_per_parent < value.atom_limits.max_atoms_per_window) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['atom_limits', 'max_atoms_per_parent'],
+      message: 'max_atoms_per_parent must be at least max_atoms_per_window',
     });
   }
 });

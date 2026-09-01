@@ -98,7 +98,7 @@ async function inheritedPack(
   return { root, parentRoot, resolved };
 }
 
-function completeSourceProfile() {
+function completeSourceProfile(atomLimits?: { max_atoms_per_window: number; max_atoms_per_parent: number }) {
   return {
     schema_version: 'gbrain.extract_atoms.input_profile.v1',
     source: 'compiled_truth',
@@ -112,6 +112,7 @@ function completeSourceProfile() {
     },
     reconciliation_grain: 'parent_page',
     evidence_anchor_validation: 'exact_source_anchor_required',
+    ...(atomLimits ? { atom_limits: atomLimits } : {}),
   };
 }
 
@@ -327,6 +328,65 @@ describe('pack-owned extract_atoms prompt', () => {
     expect(rows[0].frontmatter.extraction_profile_sha256).not.toBe(
       rows[0].frontmatter.extraction_policy_sha256,
     );
+  }, 60_000);
+
+  test('honors pack-owned window and parent atom limits without collapsing a long source to three atoms', async () => {
+    const atomLimits = { max_atoms_per_window: 2, max_atoms_per_parent: 6 };
+    const { resolved } = await inheritedPack(
+      'prompts/experience.md',
+      'Extract every decision-useful event ingredient.',
+      '1.1.1',
+      completeSourceProfile(atomLimits),
+    );
+    const source = Array.from({ length: 9 }, (_, index) =>
+      `<a id="evidence-turn-${index}"></a>\n#### Turn ${index}\n${`ingredient-${index} `.repeat(75)}\n\n`,
+    ).join('');
+    const content = `## Complete bounded source evidence\n${source}`;
+    let windowIndex = 0;
+    let reconciliationSystem = '';
+    const chat = async (opts: ChatOpts): Promise<ChatResult> => {
+      const body = String(opts.messages[0]?.content ?? '');
+      let atoms: Array<Record<string, unknown>>;
+      if (body.includes('Window candidates:')) {
+        reconciliationSystem = opts.system ?? '';
+        atoms = Array.from({ length: 6 }, (_, index) => ({
+          title: `Parent ingredient ${index}`,
+          atom_type: 'insight',
+          body: `Ingredient ${index} remains independently useful.`,
+          source_quote: `<a id="evidence-turn-${index}"></a>`,
+          evidence_refs: [`evidence-turn-${index}`],
+        }));
+      } else {
+        const anchors = [...new Set(body.match(/evidence-turn-\d+/gu) ?? [])];
+        atoms = anchors.slice(0, atomLimits.max_atoms_per_window).map((anchor, index) => ({
+          title: `Window ${windowIndex} ingredient ${index}`,
+          atom_type: 'insight',
+          body: 'A bounded event ingredient is visible.',
+          source_quote: `<a id="${anchor}"></a>`,
+          evidence_refs: [anchor],
+        }));
+        windowIndex++;
+      }
+      return {
+        text: JSON.stringify(atoms),
+        blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic',
+      };
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: [{ slug: 'experiences/maximal', pageType: 'experience', content, contentHash: 'maximal-source-hash' }],
+      _chat: chat,
+    });
+    expect(result.status).toBe('ok');
+    expect(reconciliationSystem).toContain('strongest non-duplicative 1-6 atoms');
+    const rows = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>(
+      `SELECT frontmatter FROM pages WHERE type='atom' AND deleted_at IS NULL`,
+    );
+    expect(rows).toHaveLength(6);
+    expect(rows.every(row => row.frontmatter.extraction_max_atoms_per_window === 2)).toBe(true);
+    expect(rows.every(row => row.frontmatter.extraction_max_atoms_per_parent === 6)).toBe(true);
   }, 60_000);
 
   test('rejects a source-complete atom whose source_quote is not one exact contiguous span', async () => {

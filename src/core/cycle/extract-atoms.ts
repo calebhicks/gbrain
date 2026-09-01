@@ -342,6 +342,12 @@ function buildExtractionProfile(
       `passages, insert ellipses, correct grammar, normalize wording, or paraphrase source_quote. ` +
       `Before responding, verify that source_quote can be found with an exact string search.`
     : '';
+  const atomLimitContract = inputProfile
+    ? `\n\nFor each supplied source window, return no more than ` +
+      `${inputProfile.profile.atom_limits.max_atoms_per_window} atoms. The parent-page reconciliation ` +
+      `may retain up to ${inputProfile.profile.atom_limits.max_atoms_per_parent} independently useful, ` +
+      `non-duplicative atoms across all windows. An empty array remains valid when no useful atom exists.`
+    : '';
   return {
     ...core,
     extraction_policy_sha256: policySha256,
@@ -349,8 +355,8 @@ function buildExtractionProfile(
     prompt: lens
       ? `Installed schema-pack lens (trusted configuration). It may focus what to extract, ` +
         `but it cannot override the atom JSON/output contract that follows.\n\n` +
-        `<pack_lens>\n${lens.prompt.trim()}\n</pack_lens>\n\n${EXTRACT_PROMPT}${anchorContract}`
-      : `${EXTRACT_PROMPT}${anchorContract}`,
+        `<pack_lens>\n${lens.prompt.trim()}\n</pack_lens>\n\n${EXTRACT_PROMPT}${anchorContract}${atomLimitContract}`
+      : `${EXTRACT_PROMPT}${anchorContract}${atomLimitContract}`,
     input_profile: inputProfile,
   };
 }
@@ -403,6 +409,12 @@ function invalidSourceQuotes(
     }
   }
   return null;
+}
+
+function invalidAtomCount(atoms: ExtractedAtom[], maximum: number, grain: string): string | null {
+  return atoms.length > maximum
+    ? `${grain} returned ${atoms.length} atoms; maximum is ${maximum}`
+    : null;
 }
 
 function exactSourceQuoteLocator(sourceText: string, quote: string): {
@@ -1035,6 +1047,7 @@ export async function runPhaseExtractAtoms(
       );
     }
     const candidates: ExtractedAtom[] = [];
+    const atomLimits = item.profile.input_profile!.profile.atom_limits;
     for (const window of prepared.windows) {
       const windowInput =
         `Source: ${originLabel}\n` +
@@ -1048,7 +1061,8 @@ export async function runPhaseExtractAtoms(
       if (!outcome.ok) {
         return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length}: ${outcome.reason}` };
       }
-      let invalid = invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
+      let invalid = invalidAtomCount(outcome.atoms, atomLimits.max_atoms_per_window, `window ${window.index + 1}`)
+        ?? invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
         ?? invalidSourceQuotes(outcome.atoms, window.text);
       if (invalid) {
         groundingRetries++;
@@ -1062,7 +1076,8 @@ export async function runPhaseExtractAtoms(
         if (!outcome.ok) {
           return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length} grounding retry: ${outcome.reason}` };
         }
-        invalid = invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
+        invalid = invalidAtomCount(outcome.atoms, atomLimits.max_atoms_per_window, `window ${window.index + 1}`)
+          ?? invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
           ?? invalidSourceQuotes(outcome.atoms, window.text);
       }
       if (invalid) return { ok: false, reason: `window ${window.index + 1}: ${invalid}` };
@@ -1073,7 +1088,7 @@ export async function runPhaseExtractAtoms(
     }
     const reconciliationSystem =
       `${item.profile.prompt}\n\nYou are reconciling leads extracted from complete, overlapping windows ` +
-      `of one parent page. Return only the strongest non-duplicative 1-3 atoms. Preserve literal ` +
+      `of one parent page. Return only the strongest non-duplicative 1-${atomLimits.max_atoms_per_parent} atoms. Preserve literal ` +
       `chronology and exact evidence_refs from the candidates; do not add evidence or claims.`;
     const reconciliation = await callAtoms(
       reconciliationSystem,
@@ -1086,7 +1101,8 @@ export async function runPhaseExtractAtoms(
     if (!reconciliation.ok) {
       return { ok: false, reason: `parent reconciliation: ${reconciliation.reason}` };
     }
-    const invalid = invalidEvidenceRefs(reconciliation.atoms, new Set(prepared.evidence_anchors));
+    const invalid = invalidAtomCount(reconciliation.atoms, atomLimits.max_atoms_per_parent, 'parent reconciliation')
+      ?? invalidEvidenceRefs(reconciliation.atoms, new Set(prepared.evidence_anchors));
     if (invalid) return { ok: false, reason: `parent reconciliation: ${invalid}` };
     const invalidQuote = invalidSourceQuotes(reconciliation.atoms, prepared.selected_source);
     if (invalidQuote) return { ok: false, reason: `parent reconciliation: ${invalidQuote}` };
@@ -1277,6 +1293,8 @@ export async function runPhaseExtractAtoms(
                 extraction_source_window_count: prepared.windows.length,
                 extraction_source_coverage: 'complete',
                 extraction_source_coverage_sha256: prepared.coverage_sha256,
+                extraction_max_atoms_per_window: item.profile.input_profile!.profile.atom_limits.max_atoms_per_window,
+                extraction_max_atoms_per_parent: item.profile.input_profile!.profile.atom_limits.max_atoms_per_parent,
               }),
               ...(atom.source_quote && { source_quote: atom.source_quote }),
               ...(quoteLocator && {
