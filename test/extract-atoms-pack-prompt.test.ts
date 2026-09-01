@@ -247,7 +247,7 @@ describe('pack-owned extract_atoms prompt', () => {
         reconciliationCalls++;
         const tailCandidate = body.includes('evidence-tail')
           ? { title: 'Tail counterevidence', atom_type: 'critique', body: 'The tail changes the interpretation.', source_quote: 'UNIQUE_TAIL_COUNTEREXAMPLE', evidence_refs: ['evidence-tail'] }
-          : { title: 'Visible response', atom_type: 'insight', body: 'A response was visible.', source_quote: 'turn-0', evidence_refs: ['evidence-turn-0'] };
+          : { title: 'Visible response', atom_type: 'insight', body: 'A response was visible.', source_quote: '<a id="evidence-turn-0"></a>', evidence_refs: ['evidence-turn-0'] };
         text = JSON.stringify([tailCandidate]);
       } else {
         windowCalls.push(body);
@@ -257,7 +257,7 @@ describe('pack-owned extract_atoms prompt', () => {
           title: anchor === 'evidence-tail' ? 'Tail counterevidence' : `Lead ${windowCalls.length}`,
           atom_type: anchor === 'evidence-tail' ? 'critique' : 'insight',
           body: anchor === 'evidence-tail' ? 'The tail changes the interpretation.' : 'A bounded response was visible.',
-          source_quote: anchor === 'evidence-tail' ? 'UNIQUE_TAIL_COUNTEREXAMPLE' : anchor.replace('evidence-', ''),
+          source_quote: anchor === 'evidence-tail' ? 'UNIQUE_TAIL_COUNTEREXAMPLE' : `<a id="${anchor}"></a>`,
           evidence_refs: [anchor],
         }] : []);
       }
@@ -358,5 +358,9 @@ describe('pack-owned extract_atoms prompt', () => {
     );
     expect(atoms).toHaveLength(1);
     expect(atoms[0].frontmatter.source_quote).toBe('The buyer will invite procurement next Thursday.');
+    expect(atoms[0].frontmatter.extraction_source_quote_span_unit).toBe('utf16_code_units_v1');
+    expect(atoms[0].frontmatter.extraction_source_quote_start).toBe(content.indexOf('The buyer will invite'));
+    expect(atoms[0].frontmatter.extraction_source_quote_end).toBe(content.length);
+    expect(atoms[0].frontmatter.extraction_source_quote_sha256).toMatch(/^[a-f0-9]{64}$/);
   }, 60_000);
 });

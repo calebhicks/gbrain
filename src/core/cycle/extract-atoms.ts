@@ -389,8 +389,23 @@ function invalidSourceQuotes(
     if (!sourceText.includes(quote)) {
       return `atom ${JSON.stringify(atom.title)} source_quote is not an exact contiguous source span`;
     }
+    if (sourceText.indexOf(quote) !== sourceText.lastIndexOf(quote)) {
+      return `atom ${JSON.stringify(atom.title)} source_quote is ambiguous within the selected source`;
+    }
   }
   return null;
+}
+
+function exactSourceQuoteLocator(sourceText: string, quote: string): {
+  start: number;
+  end: number;
+  sha256: string;
+} {
+  const start = sourceText.indexOf(quote);
+  if (start < 0 || start !== sourceText.lastIndexOf(quote)) {
+    throw new Error('source_quote locator requires one exact unique source span');
+  }
+  return { start, end: start + quote.length, sha256: createHash('sha256').update(quote).digest('hex') };
 }
 
 interface DiscoveredPage {
@@ -1198,6 +1213,9 @@ export async function runPhaseExtractAtoms(
         // pages, so there is no from-endpoint to link.
         const provenanceLinks: LinkBatchInput[] = [];
         for (const atom of atoms) {
+          const quoteLocator = prepared && atom.source_quote
+            ? exactSourceQuoteLocator(prepared.selected_source, atom.source_quote)
+            : null;
           const srcRef = item.kind === 'transcript' ? item.filePath : item.slug;
           const slug = atomSlug(
             atom.title,
@@ -1252,6 +1270,12 @@ export async function runPhaseExtractAtoms(
                 extraction_source_coverage_sha256: prepared.coverage_sha256,
               }),
               ...(atom.source_quote && { source_quote: atom.source_quote }),
+              ...(quoteLocator && {
+                extraction_source_quote_span_unit: 'utf16_code_units_v1',
+                extraction_source_quote_start: prepared!.source_start + quoteLocator.start,
+                extraction_source_quote_end: prepared!.source_start + quoteLocator.end,
+                extraction_source_quote_sha256: quoteLocator.sha256,
+              }),
               ...(atom.lesson && { lesson: atom.lesson }),
               ...(atom.concepts && atom.concepts.length > 0 && { concepts: atom.concepts }),
               ...(atom.virality_score !== undefined && { virality_score: atom.virality_score }),
