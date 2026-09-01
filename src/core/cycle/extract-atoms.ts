@@ -328,7 +328,10 @@ function buildExtractionProfile(
   const anchorContract = inputProfile
     ? `\n\nThe installed input profile requires every returned atom to include evidence_refs, ` +
       `an array containing at least one exact evidence-* anchor from the supplied source window. ` +
-      `Never invent or alter an anchor.`
+      `Never invent or alter an anchor. It also requires source_quote to be one exact, contiguous, ` +
+      `verbatim substring of the supplied source window, at most 200 characters. Never join separate ` +
+      `passages, insert ellipses, correct grammar, normalize wording, or paraphrase source_quote. ` +
+      `Before responding, verify that source_quote can be found with an exact string search.`
     : '';
   return {
     ...core,
@@ -368,6 +371,23 @@ function invalidEvidenceRefs(
     const missing = atom.evidence_refs.filter(ref => !allowedAnchors.has(ref));
     if (missing.length > 0) {
       return `atom ${JSON.stringify(atom.title)} cited anchors absent from its source: ${missing.join(', ')}`;
+    }
+  }
+  return null;
+}
+
+function invalidSourceQuotes(
+  atoms: ExtractedAtom[],
+  sourceText: string,
+): string | null {
+  for (const atom of atoms) {
+    const quote = atom.source_quote;
+    if (!quote) return `atom ${JSON.stringify(atom.title)} omitted required source_quote`;
+    if ([...quote].length > 200) {
+      return `atom ${JSON.stringify(atom.title)} source_quote exceeds 200 characters`;
+    }
+    if (!sourceText.includes(quote)) {
+      return `atom ${JSON.stringify(atom.title)} source_quote is not an exact contiguous source span`;
     }
   }
   return null;
@@ -953,6 +973,7 @@ export async function runPhaseExtractAtoms(
 
   // ── gbrain#4148 helpers ────────────────────────────────────────────
   let malformedOutputs = 0;
+  let groundingRetries = 0;
   const tombstonedForFailures: string[] = [];
   // #3044 adoption: shared halt policy — auth/billing halt on the first hit,
   // a rate_limit streak halts after 3 consecutive failures, a successful
@@ -991,20 +1012,35 @@ export async function runPhaseExtractAtoms(
     }
     const candidates: ExtractedAtom[] = [];
     for (const window of prepared.windows) {
-      const outcome = await callAtoms(
-        item.profile.prompt,
+      const windowInput =
         `Source: ${originLabel}\n` +
           `Selected source SHA-256: ${prepared.source_section_sha256}\n` +
           `Window: ${window.index + 1}/${prepared.windows.length}\n` +
           `Source character range: [${window.start}, ${window.end})\n` +
           `Window SHA-256: ${window.sha256}\n` +
           `Available evidence anchors: ${window.evidence_anchors.join(', ') || '(none)'}\n\n---\n\n` +
-          window.text,
-      );
+          window.text;
+      let outcome = await callAtoms(item.profile.prompt, windowInput);
       if (!outcome.ok) {
         return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length}: ${outcome.reason}` };
       }
-      const invalid = invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors));
+      let invalid = invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
+        ?? invalidSourceQuotes(outcome.atoms, window.text);
+      if (invalid) {
+        groundingRetries++;
+        outcome = await callAtoms(
+          `${item.profile.prompt}\n\nSTRICT GROUNDING RETRY: the previous candidate failed deterministic ` +
+          `source grounding (${invalid}). Return the complete JSON array again. Every evidence_refs value ` +
+          `must be present in Available evidence anchors, and every source_quote must be one exact ` +
+          `contiguous substring copied from the supplied window.`,
+          windowInput,
+        );
+        if (!outcome.ok) {
+          return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length} grounding retry: ${outcome.reason}` };
+        }
+        invalid = invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
+          ?? invalidSourceQuotes(outcome.atoms, window.text);
+      }
       if (invalid) return { ok: false, reason: `window ${window.index + 1}: ${invalid}` };
       candidates.push(...outcome.atoms);
     }
@@ -1028,6 +1064,8 @@ export async function runPhaseExtractAtoms(
     }
     const invalid = invalidEvidenceRefs(reconciliation.atoms, new Set(prepared.evidence_anchors));
     if (invalid) return { ok: false, reason: `parent reconciliation: ${invalid}` };
+    const invalidQuote = invalidSourceQuotes(reconciliation.atoms, prepared.selected_source);
+    if (invalidQuote) return { ok: false, reason: `parent reconciliation: ${invalidQuote}` };
     return reconciliation;
   }
 
@@ -1420,6 +1458,7 @@ export async function runPhaseExtractAtoms(
       failures,
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
       malformed_outputs: malformedOutputs,
+      grounding_retries: groundingRetries,
       tombstoned_for_failures: tombstonedForFailures,
       estimated_spend_usd: estimatedSpendUsd,
       budget_usd: budgetCap,

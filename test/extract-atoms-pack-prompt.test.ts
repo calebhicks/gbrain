@@ -246,8 +246,8 @@ describe('pack-owned extract_atoms prompt', () => {
       if (body.includes('Window candidates:')) {
         reconciliationCalls++;
         const tailCandidate = body.includes('evidence-tail')
-          ? { title: 'Tail counterevidence', atom_type: 'critique', body: 'The tail changes the interpretation.', evidence_refs: ['evidence-tail'] }
-          : { title: 'Visible response', atom_type: 'insight', body: 'A response was visible.', evidence_refs: ['evidence-turn-0'] };
+          ? { title: 'Tail counterevidence', atom_type: 'critique', body: 'The tail changes the interpretation.', source_quote: 'UNIQUE_TAIL_COUNTEREXAMPLE', evidence_refs: ['evidence-tail'] }
+          : { title: 'Visible response', atom_type: 'insight', body: 'A response was visible.', source_quote: 'turn-0', evidence_refs: ['evidence-turn-0'] };
         text = JSON.stringify([tailCandidate]);
       } else {
         windowCalls.push(body);
@@ -257,6 +257,7 @@ describe('pack-owned extract_atoms prompt', () => {
           title: anchor === 'evidence-tail' ? 'Tail counterevidence' : `Lead ${windowCalls.length}`,
           atom_type: anchor === 'evidence-tail' ? 'critique' : 'insight',
           body: anchor === 'evidence-tail' ? 'The tail changes the interpretation.' : 'A bounded response was visible.',
+          source_quote: anchor === 'evidence-tail' ? 'UNIQUE_TAIL_COUNTEREXAMPLE' : anchor.replace('evidence-', ''),
           evidence_refs: [anchor],
         }] : []);
       }
@@ -287,5 +288,75 @@ describe('pack-owned extract_atoms prompt', () => {
     expect(rows[0].frontmatter.extraction_profile_sha256).not.toBe(
       rows[0].frontmatter.extraction_policy_sha256,
     );
+  }, 60_000);
+
+  test('rejects a source-complete atom whose source_quote is not one exact contiguous span', async () => {
+    const { resolved } = await inheritedPack(
+      'prompts/experience.md',
+      'Find bounded visible change.',
+      '1.2.0',
+      completeSourceProfile(),
+    );
+    const content =
+      '## Complete bounded source evidence\n' +
+      '<a id="evidence-turn-0"></a>\nThe buyer will invite procurement next Thursday.';
+    const chat = async (): Promise<ChatResult> => ({
+      text: JSON.stringify([{
+        title: 'Procurement commitment', atom_type: 'insight', body: 'The buyer made a dated commitment.',
+        source_quote: 'The buyer agreed to invite procurement next Thursday.',
+        evidence_refs: ['evidence-turn-0'],
+      }]),
+      blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+      usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic',
+    });
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: [{ slug: 'experiences/quote-drift', pageType: 'experience', content, contentHash: 'quote-drift-source-hash' }],
+      _chat: chat,
+    });
+    expect(result.status).toBe('warn');
+    expect(result.details?.malformed_outputs).toBe(1);
+    expect(String((result.details?.failures as Array<{ error: string }>)[0]?.error)).toContain('source_quote');
+    const atoms = await engine.executeRaw(`SELECT slug FROM pages WHERE type='atom' AND deleted_at IS NULL`);
+    expect(atoms).toHaveLength(0);
+  }, 60_000);
+
+  test('makes one bounded native grounding retry and admits only the exact replacement', async () => {
+    const { resolved } = await inheritedPack(
+      'prompts/experience.md', 'Find bounded visible change.', '1.3.0', completeSourceProfile(),
+    );
+    const content =
+      '## Complete bounded source evidence\n' +
+      '<a id="evidence-turn-0"></a>\nThe buyer will invite procurement next Thursday.';
+    let calls = 0;
+    const chat = async (): Promise<ChatResult> => {
+      calls++;
+      return {
+        text: JSON.stringify([{
+          title: 'Procurement commitment', atom_type: 'insight', body: 'The buyer made a dated commitment.',
+          source_quote: calls === 1
+            ? 'The buyer agreed to invite procurement next Thursday.'
+            : 'The buyer will invite procurement next Thursday.',
+          evidence_refs: ['evidence-turn-0'],
+        }]),
+        blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic',
+      };
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: [{ slug: 'experiences/quote-repair', pageType: 'experience', content, contentHash: 'quote-repair-source-hash' }],
+      _chat: chat,
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.grounding_retries).toBe(1);
+    expect(calls).toBe(2);
+    const atoms = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>(
+      `SELECT frontmatter FROM pages WHERE type='atom' AND deleted_at IS NULL`,
+    );
+    expect(atoms).toHaveLength(1);
+    expect(atoms[0].frontmatter.source_quote).toBe('The buyer will invite procurement next Thursday.');
   }, 60_000);
 });
