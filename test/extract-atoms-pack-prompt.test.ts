@@ -332,6 +332,44 @@ describe('pack-owned extract_atoms prompt', () => {
     );
   }, 60_000);
 
+  test('persists a private native attempt intent before the call and response usage after it', async () => {
+    const { resolved } = await inheritedPack(
+      'prompts/experience.md', 'Find bounded visible change.', '1.0.1', completeSourceProfile(),
+    );
+    const content = '## Complete bounded source evidence\n<a id="evidence-turn-0"></a>\nThe buyer committed to a dated follow-up.';
+    const chat = async (): Promise<ChatResult> => {
+      const intents = await engine.executeRaw<{ slug: string; status: string }>(
+        `SELECT slug,frontmatter->>'attempt_status' status FROM pages WHERE type='extract_receipt' AND frontmatter->>'kind'='native-extract-attempt'`,
+      );
+      expect(intents).toHaveLength(1);
+      expect(intents[0].status).toBe('intent_recorded');
+      const raw = await engine.getRawData(intents[0].slug, undefined, { sourceId: 'default' });
+      expect(raw.map(row => row.source)).toEqual(['native-extract-attempt-input']);
+      return {
+        text: JSON.stringify([{ title: 'Dated buyer commitment', atom_type: 'insight', body: 'The buyer owns a dated follow-up.', source_quote: 'The buyer committed to a dated follow-up.', evidence_refs: ['evidence-turn-0'] }]),
+        blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+        usage: { input_tokens: 101, output_tokens: 29, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-5.6-luna', providerId: 'openai', providerMetadata: { response_id: 'fixture-response' },
+      };
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: [{ slug: 'experiences/audited', pageType: 'experience', content, contentHash: 'audited-source-hash' }],
+      _chat: chat, _attemptAuditRunId: 'checkpoint-audit-v1',
+    });
+    expect(result.status).toBe('ok');
+    const attempts = await engine.executeRaw<{ slug: string; frontmatter: Record<string, unknown>; compiled_truth: string }>(
+      `SELECT slug,frontmatter,compiled_truth FROM pages WHERE type='extract_receipt' AND frontmatter->>'kind'='native-extract-attempt'`,
+    );
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].frontmatter.attempt_status).toBe('response_recorded');
+    expect(attempts[0].frontmatter.input_tokens).toBe(101);
+    expect(attempts[0].frontmatter.output_tokens).toBe(29);
+    expect(attempts[0].compiled_truth).not.toContain('The buyer committed');
+    const raw = await engine.getRawData(attempts[0].slug, undefined, { sourceId: 'default' });
+    expect(raw.map(row => row.source).sort()).toEqual(['native-extract-attempt-input', 'native-extract-attempt-response']);
+  }, 60_000);
+
   test('honors pack-owned window and parent atom limits without collapsing a long source to three atoms', async () => {
     const atomLimits = { max_atoms_per_window: 2, max_atoms_per_parent: 6 };
     const { resolved } = await inheritedPack(

@@ -212,6 +212,12 @@ export interface ExtractAtomsOpts {
   /** Test seam: pre-resolved active pack, including declaration origins. */
   _resolvedPack?: ResolvedPack | null;
   /**
+   * Native per-call audit run identity. When present, every model call writes
+   * a private intent page before provider invocation and a raw response/usage
+   * sidecar afterward. The identity must be stable across a governed run.
+   */
+  _attemptAuditRunId?: string;
+  /**
    * v0.41.19.0 (T3): cooperative yield hook fired from inside the work
    * loop on a 30s throttle AND immediately after every `await chat()`
    * LLM call. Cycle.ts threads `buildYieldDuringPhase(lock, outer)` so
@@ -746,6 +752,10 @@ export async function runPhaseExtractAtoms(
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
+  const attemptAuditRunId = opts._attemptAuditRunId?.trim() || null;
+  if (attemptAuditRunId && !/^[a-zA-Z0-9._-]{1,128}$/u.test(attemptAuditRunId)) {
+    throw new Error('extract_atoms attempt audit run id is invalid');
+  }
 
   let extractModel = resolveTierDefault('utility');
   let budgetCap = DEFAULT_BUDGET_USD;
@@ -1031,14 +1041,104 @@ export async function runPhaseExtractAtoms(
   // EXCEPT the ones TRANSIENT_EXTRACT_ERROR_RE + the rate_limit abort class
   // say are "retryable, never counted" — see that regex's doc comment.
   let hardFailureCount = 0;
+  let attemptOrdinal = 0;
 
-  async function callAtoms(system: string, content: string): Promise<AtomsParseOutcome> {
-    const result = await chat({
-      model: extractModel,
-      system,
-      messages: [{ role: 'user', content }],
-      maxTokens: maxOutputTokens,
-    });
+  const hashText = (value: string): string =>
+    createHash('sha256').update(value).digest('hex');
+
+  async function putAttemptPage(
+    slug: string,
+    ordinal: number,
+    attemptKind: string,
+    status: 'intent_recorded' | 'response_recorded' | 'provider_failed',
+    inputHashes: { system: string; content: string },
+    result?: Awaited<ReturnType<typeof chat>>,
+    error?: unknown,
+  ): Promise<void> {
+    const recordedAt = new Date().toISOString();
+    const errorMessage = error instanceof Error ? error.message : error == null ? null : String(error);
+    await engine.putPage(slug, {
+      type: 'extract_receipt',
+      title: `Native atom extraction attempt ${ordinal}`,
+      compiled_truth: [
+        '# Native atom extraction attempt',
+        '',
+        `Run: \`${attemptAuditRunId}\``,
+        `Attempt: **${ordinal}**`,
+        `State: \`${status}\``,
+        '',
+        'Prompt and provider payloads are retained in private raw sidecars.',
+      ].join('\n'),
+      frontmatter: {
+        type: 'extract_receipt',
+        visibility: 'private',
+        dream_generated: true,
+        raw_trace_exempt: true,
+        raw_trace_exempt_reason: 'native model-attempt receipt; raw payloads are private sidecars',
+        kind: 'native-extract-attempt',
+        run_id: attemptAuditRunId,
+        attempt_ordinal: ordinal,
+        attempt_kind: attemptKind,
+        attempt_status: status,
+        model_id: extractModel,
+        max_output_tokens: maxOutputTokens,
+        system_sha256: inputHashes.system,
+        input_sha256: inputHashes.content,
+        recorded_at: recordedAt,
+        ...(result && {
+          response_sha256: hashText(result.text),
+          response_model: result.model,
+          provider_id: result.providerId,
+          stop_reason: result.stopReason,
+          input_tokens: result.usage.input_tokens,
+          output_tokens: result.usage.output_tokens,
+          cache_read_tokens: result.usage.cache_read_tokens,
+          cache_creation_tokens: result.usage.cache_creation_tokens,
+        }),
+        ...(errorMessage && { error_sha256: hashText(errorMessage) }),
+      },
+    }, { sourceId });
+  }
+
+  async function callAtoms(system: string, content: string, attemptKind: string): Promise<AtomsParseOutcome> {
+    const ordinal = ++attemptOrdinal;
+    const inputHashes = { system: hashText(system), content: hashText(content) };
+    const attemptSlug = attemptAuditRunId
+      ? `extracts/${new Date().toISOString().slice(0, 10)}/atom-attempts/${hashText(`${sourceId}\n${attemptAuditRunId}`).slice(0, 16)}/attempt-${String(ordinal).padStart(6, '0')}`
+      : null;
+    if (attemptSlug) {
+      await putAttemptPage(attemptSlug, ordinal, attemptKind, 'intent_recorded', inputHashes);
+      await engine.putRawData(attemptSlug, 'native-extract-attempt-input', { system, content }, { sourceId });
+    }
+    let result: Awaited<ReturnType<typeof chat>>;
+    try {
+      result = await chat({
+        model: extractModel,
+        system,
+        messages: [{ role: 'user', content }],
+        maxTokens: maxOutputTokens,
+      });
+    } catch (error) {
+      if (attemptSlug) {
+        await putAttemptPage(attemptSlug, ordinal, attemptKind, 'provider_failed', inputHashes, undefined, error);
+        await engine.putRawData(attemptSlug, 'native-extract-attempt-error', {
+          message: error instanceof Error ? error.message : String(error),
+        }, { sourceId });
+      }
+      throw error;
+    }
+    if (attemptSlug) {
+      await engine.putRawData(attemptSlug, 'native-extract-attempt-response', {
+        text: result.text,
+        blocks: result.blocks,
+        stop_reason: result.stopReason,
+        usage: result.usage,
+        model: result.model,
+        provider_id: result.providerId,
+        provider_metadata: result.providerMetadata ?? null,
+      }, { sourceId });
+      await putAttemptPage(attemptSlug, ordinal, attemptKind, 'response_recorded', inputHashes, result);
+    }
     await maybeYield();
     llmHalt.reset();
     if (pacingMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, pacingMs));
@@ -1054,6 +1154,7 @@ export async function runPhaseExtractAtoms(
       return callAtoms(
         item.profile.prompt,
         `Source: ${originLabel}\n\n---\n\n${truncateUtf8(item.content, maxInputChars)}`,
+        'single-source',
       );
     }
     const candidates: ExtractedAtom[] = [];
@@ -1067,7 +1168,7 @@ export async function runPhaseExtractAtoms(
           `Window SHA-256: ${window.sha256}\n` +
           `Available evidence anchors: ${window.evidence_anchors.join(', ') || '(none)'}\n\n---\n\n` +
           window.text;
-      let outcome = await callAtoms(item.profile.prompt, windowInput);
+      let outcome = await callAtoms(item.profile.prompt, windowInput, `window-${window.index + 1}`);
       if (!outcome.ok) {
         return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length}: ${outcome.reason}` };
       }
@@ -1082,6 +1183,7 @@ export async function runPhaseExtractAtoms(
           `must be present in Available evidence anchors, and every source_quote must be one exact ` +
           `contiguous substring copied from the supplied window.`,
           windowInput,
+          `window-${window.index + 1}-grounding-retry`,
         );
         if (!outcome.ok) {
           return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length} grounding retry: ${outcome.reason}` };
@@ -1108,7 +1210,8 @@ export async function runPhaseExtractAtoms(
         `Selected source SHA-256: ${prepared.source_section_sha256}\n` +
         `Coverage manifest SHA-256: ${prepared.coverage_sha256}\n` +
         `Allowed evidence anchors: ${prepared.evidence_anchors.join(', ')}\n\n` +
-        `Window candidates:\n${JSON.stringify(candidates)}`,
+      `Window candidates:\n${JSON.stringify(candidates)}`,
+      'parent-reconciliation',
     );
     if (!reconciliation.ok) {
       return { ok: false, reason: `parent reconciliation: ${reconciliation.reason}` };
