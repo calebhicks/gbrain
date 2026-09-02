@@ -75,6 +75,12 @@ import {
   type PreparedAtomSource,
   type ResolvedAtomInputProfile,
 } from '../schema-pack/source-input-profile.ts';
+import {
+  exactSourceQuoteLocator,
+  invalidSourceQuotes,
+  repairSourceQuotes,
+  type SourceQuoteRepair,
+} from './source-quote-grounding.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -255,6 +261,9 @@ interface ExtractedAtom {
   emotional_register?: string;
   /** Exact source anchors required by source-complete input profiles. */
   evidence_refs?: string[];
+  /** Deterministic admission metadata; never accepted from the model parser. */
+  source_quote_repair?: SourceQuoteRepair;
+  source_quote_candidate_sha256?: string;
 }
 
 /** kebab-case validator for concept labels ("captive-portal", "channel-pricing"). */
@@ -400,42 +409,10 @@ function invalidEvidenceRefs(
   return null;
 }
 
-function invalidSourceQuotes(
-  atoms: ExtractedAtom[],
-  sourceText: string,
-): string | null {
-  for (const atom of atoms) {
-    const quote = atom.source_quote;
-    if (!quote) return `atom ${JSON.stringify(atom.title)} omitted required source_quote`;
-    if ([...quote].length > 200) {
-      return `atom ${JSON.stringify(atom.title)} source_quote exceeds 200 characters`;
-    }
-    if (!sourceText.includes(quote)) {
-      return `atom ${JSON.stringify(atom.title)} source_quote is not an exact contiguous source span`;
-    }
-    if (sourceText.indexOf(quote) !== sourceText.lastIndexOf(quote)) {
-      return `atom ${JSON.stringify(atom.title)} source_quote is ambiguous within the selected source`;
-    }
-  }
-  return null;
-}
-
 function invalidAtomCount(atoms: ExtractedAtom[], maximum: number, grain: string): string | null {
   return atoms.length > maximum
     ? `${grain} returned ${atoms.length} atoms; maximum is ${maximum}`
     : null;
-}
-
-function exactSourceQuoteLocator(sourceText: string, quote: string): {
-  start: number;
-  end: number;
-  sha256: string;
-} {
-  const start = sourceText.indexOf(quote);
-  if (start < 0 || start !== sourceText.lastIndexOf(quote)) {
-    throw new Error('source_quote locator requires one exact unique source span');
-  }
-  return { start, end: start + quote.length, sha256: createHash('sha256').update(quote).digest('hex') };
 }
 
 interface DiscoveredPage {
@@ -1172,6 +1149,7 @@ export async function runPhaseExtractAtoms(
       if (!outcome.ok) {
         return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length}: ${outcome.reason}` };
       }
+      outcome = { ok: true, atoms: repairSourceQuotes(outcome.atoms, window.text) };
       let invalid = invalidAtomCount(outcome.atoms, atomLimits.max_atoms_per_window, `window ${window.index + 1}`)
         ?? invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
         ?? invalidSourceQuotes(outcome.atoms, window.text);
@@ -1188,6 +1166,7 @@ export async function runPhaseExtractAtoms(
         if (!outcome.ok) {
           return { ok: false, reason: `window ${window.index + 1}/${prepared.windows.length} grounding retry: ${outcome.reason}` };
         }
+        outcome = { ok: true, atoms: repairSourceQuotes(outcome.atoms, window.text) };
         invalid = invalidAtomCount(outcome.atoms, atomLimits.max_atoms_per_window, `window ${window.index + 1}`)
           ?? invalidEvidenceRefs(outcome.atoms, new Set(window.evidence_anchors))
           ?? invalidSourceQuotes(outcome.atoms, window.text);
@@ -1216,12 +1195,16 @@ export async function runPhaseExtractAtoms(
     if (!reconciliation.ok) {
       return { ok: false, reason: `parent reconciliation: ${reconciliation.reason}` };
     }
-    const invalid = invalidAtomCount(reconciliation.atoms, atomLimits.max_atoms_per_parent, 'parent reconciliation')
-      ?? invalidEvidenceRefs(reconciliation.atoms, new Set(prepared.evidence_anchors));
+    const groundedReconciliation = {
+      ok: true as const,
+      atoms: repairSourceQuotes(reconciliation.atoms, prepared.selected_source),
+    };
+    const invalid = invalidAtomCount(groundedReconciliation.atoms, atomLimits.max_atoms_per_parent, 'parent reconciliation')
+      ?? invalidEvidenceRefs(groundedReconciliation.atoms, new Set(prepared.evidence_anchors));
     if (invalid) return { ok: false, reason: `parent reconciliation: ${invalid}` };
-    const invalidQuote = invalidSourceQuotes(reconciliation.atoms, prepared.selected_source);
+    const invalidQuote = invalidSourceQuotes(groundedReconciliation.atoms, prepared.selected_source);
     if (invalidQuote) return { ok: false, reason: `parent reconciliation: ${invalidQuote}` };
-    return reconciliation;
+    return groundedReconciliation;
   }
 
   /** Stamp the zero-yield/complete tombstone (hash-keyed; edits re-eligibilize). */
@@ -1423,6 +1406,10 @@ export async function runPhaseExtractAtoms(
                 extraction_source_quote_start: prepared!.source_start + quoteLocator.start,
                 extraction_source_quote_end: prepared!.source_start + quoteLocator.end,
                 extraction_source_quote_sha256: quoteLocator.sha256,
+              }),
+              ...(atom.source_quote_repair && {
+                extraction_source_quote_repair: atom.source_quote_repair,
+                extraction_source_quote_candidate_sha256: atom.source_quote_candidate_sha256,
               }),
               ...(atom.lesson && { lesson: atom.lesson }),
               ...(atom.concepts && atom.concepts.length > 0 && { concepts: atom.concepts }),

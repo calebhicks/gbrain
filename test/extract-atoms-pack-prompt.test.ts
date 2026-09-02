@@ -463,6 +463,48 @@ describe('pack-owned extract_atoms prompt', () => {
     expect(atoms).toHaveLength(0);
   }, 60_000);
 
+  test('repairs a uniquely token-aligned quote to the exact native source span without another model call', async () => {
+    const { resolved } = await inheritedPack(
+      'prompts/experience.md', 'Find bounded visible change.', '1.2.1', completeSourceProfile(),
+    );
+    const exactQuote = 'Buyer’s team:\n“Bring procurement, next Thursday.”';
+    const content =
+      '## Complete bounded source evidence\n' +
+      '<a id="evidence-turn-0"></a>\n' + exactQuote;
+    let calls = 0;
+    const chat = async (): Promise<ChatResult> => {
+      calls++;
+      return {
+        text: JSON.stringify([{
+          title: 'Procurement commitment', atom_type: 'insight', body: 'The buyer made a dated commitment.',
+          source_quote: 'buyer\'s team: "bring procurement next thursday"',
+          evidence_refs: ['evidence-turn-0'],
+        }]),
+        blocks: [{ type: 'text', text: '' }], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openai:gpt-5.6-luna', providerId: 'openai',
+      };
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _resolvedPack: resolved, _transcripts: [],
+      _pages: [{ slug: 'experiences/token-quote-repair', pageType: 'experience', content, contentHash: 'token-quote-repair-source-hash' }],
+      _chat: chat,
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.grounding_retries).toBe(0);
+    expect(calls).toBe(1);
+    const atoms = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>(
+      `SELECT frontmatter FROM pages WHERE type='atom' AND deleted_at IS NULL`,
+    );
+    expect(atoms).toHaveLength(1);
+    const repairedQuote = 'Buyer’s team:\n“Bring procurement, next Thursday';
+    expect(atoms[0].frontmatter.source_quote).toBe(repairedQuote);
+    expect(atoms[0].frontmatter.extraction_source_quote_repair).toBe('unique_token_sequence_v1');
+    expect(atoms[0].frontmatter.extraction_source_quote_candidate_sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(atoms[0].frontmatter.extraction_source_quote_start).toBe(content.indexOf(exactQuote));
+    expect(atoms[0].frontmatter.extraction_source_quote_end).toBe(content.indexOf(repairedQuote) + repairedQuote.length);
+  }, 60_000);
+
   test('makes one bounded native grounding retry and admits only the exact replacement', async () => {
     const { resolved } = await inheritedPack(
       'prompts/experience.md', 'Find bounded visible change.', '1.3.0', completeSourceProfile(),
