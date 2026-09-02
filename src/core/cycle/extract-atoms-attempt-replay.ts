@@ -21,7 +21,10 @@ interface AttemptResponse {
 
 interface ReplayEntry {
   slug: string;
+  attemptKind: string;
+  inputSha256: string;
   response: AttemptResponse;
+  consumed: boolean;
 }
 
 export interface NativeAttemptReplay {
@@ -72,6 +75,7 @@ export async function createNativeAttemptReplayChat(
   );
   if (rows.length === 0) fail('no response-recorded attempts found');
   const queues = new Map<string, ReplayEntry[]>();
+  const groundingByInput = new Map<string, ReplayEntry[]>();
   const ordinals = new Set<number>();
   for (const row of rows) {
     const fm = row.frontmatter;
@@ -94,10 +98,23 @@ export async function createNativeAttemptReplayChat(
         || !['end', 'tool_calls', 'length', 'refusal', 'content_filter', 'other'].includes(response.stop_reason)) {
       fail(`${row.slug} response shape is invalid`);
     }
+    const attemptKind = String(fm.attempt_kind ?? '');
+    const entry = {
+      slug: row.slug,
+      attemptKind,
+      inputSha256: sha256(input.content),
+      response,
+      consumed: false,
+    };
     const key = requestKey(input.system, input.content);
     const queue = queues.get(key) ?? [];
-    queue.push({ slug: row.slug, response });
+    queue.push(entry);
     queues.set(key, queue);
+    if (attemptKind.endsWith('-grounding-retry')) {
+      const candidates = groundingByInput.get(entry.inputSha256) ?? [];
+      candidates.push(entry);
+      groundingByInput.set(entry.inputSha256, candidates);
+    }
   }
 
   let consumed = 0;
@@ -110,8 +127,19 @@ export async function createNativeAttemptReplayChat(
       }
       const content = chatOpts.messages[0].content;
       const key = requestKey(system, content);
-      const entry = queues.get(key)?.shift();
+      const exactQueue = queues.get(key);
+      let entry = exactQueue?.find(candidate => !candidate.consumed);
+      let matchBasis = 'exact_request_v1';
+      if (!entry && system.includes('STRICT GROUNDING RETRY:')) {
+        const candidates = (groundingByInput.get(sha256(content)) ?? [])
+          .filter(candidate => !candidate.consumed);
+        if (candidates.length === 1) {
+          [entry] = candidates;
+          matchBasis = 'exact_source_input_grounding_retry_v1';
+        }
+      }
       if (!entry) fail('request hashes are absent or already consumed');
+      entry.consumed = true;
       consumed += 1;
       return {
         text: entry.response.text,
@@ -123,6 +151,7 @@ export async function createNativeAttemptReplayChat(
         providerMetadata: {
           replayed_attempt_slug_sha256: sha256(entry.slug),
           replayed_response_sha256: sha256(entry.response.text),
+          replay_match_basis: matchBasis,
         },
       };
     },

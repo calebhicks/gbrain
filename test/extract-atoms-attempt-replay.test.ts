@@ -60,6 +60,7 @@ describe('native atom extraction attempt replay', () => {
     expect(result.providerMetadata).toEqual({
       replayed_attempt_slug_sha256: sha256(slug),
       replayed_response_sha256: sha256(response),
+      replay_match_basis: 'exact_request_v1',
     });
     expect(replay.stats()).toEqual({ available: 1, consumed: 1, remaining: 0, provider_calls: 0 });
     await expect(replay.chat({
@@ -94,5 +95,43 @@ describe('native atom extraction attempt replay', () => {
     }, { sourceId });
     await expect(createNativeAttemptReplayChat(engine, { sourceId, runId }))
       .rejects.toThrow('response hash mismatch');
+  });
+
+  test('replays one unique grounding response when only the validation-error system text changed', async () => {
+    await resetPgliteState(engine);
+    const sourceId = 'winloss-test';
+    await registerSource(sourceId);
+    const runId = 'native-population-test';
+    const priorSystem = 'STRICT GROUNDING RETRY: prior deterministic error.';
+    const currentSystem = 'STRICT GROUNDING RETRY: repaired deterministic error.';
+    const content = 'Source: one exact native source window';
+    const response = '[{"title":"Grounded"}]';
+    const slug = 'extracts/2026-09-02/atom-attempts/test/attempt-000001';
+    await engine.putPage(slug, {
+      type: 'extract_receipt', title: 'Attempt', compiled_truth: '# Attempt',
+      frontmatter: {
+        type: 'extract_receipt', kind: 'native-extract-attempt', run_id: runId,
+        attempt_ordinal: 1, attempt_kind: 'window-1-grounding-retry', attempt_status: 'response_recorded',
+        system_sha256: sha256(priorSystem), input_sha256: sha256(content),
+        response_sha256: sha256(response), model_id: 'openai:gpt-5.6-luna',
+      },
+    }, { sourceId });
+    await engine.putRawData(slug, 'native-extract-attempt-input', { system: priorSystem, content }, { sourceId });
+    await engine.putRawData(slug, 'native-extract-attempt-response', {
+      text: response, blocks: [], stop_reason: 'end', usage: {},
+      model: 'openai:gpt-5.6-luna', provider_id: 'openai',
+    }, { sourceId });
+
+    const replay = await createNativeAttemptReplayChat(engine, { sourceId, runId });
+    const result = await replay.chat({
+      model: 'openai:gpt-5.6-luna', system: currentSystem,
+      messages: [{ role: 'user', content }], maxTokens: 8_000,
+    });
+    expect(result.text).toBe(response);
+    expect(result.providerMetadata?.replay_match_basis).toBe('exact_source_input_grounding_retry_v1');
+    await expect(replay.chat({
+      model: 'openai:gpt-5.6-luna', system: currentSystem,
+      messages: [{ role: 'user', content: `${content} drift` }], maxTokens: 8_000,
+    })).rejects.toThrow('absent or already consumed');
   });
 });
