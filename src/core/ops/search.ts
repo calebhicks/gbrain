@@ -104,6 +104,7 @@ function normalizeTypesParam(raw: unknown): string[] | undefined {
     : typeof raw === 'string'
       ? raw.split(',')
       : null;
+  if (Array.isArray(raw) && raw.length === 0) return undefined;
   if (arr === null || arr.some((t) => typeof t !== 'string')) {
     throw new OperationError(
       'invalid_params',
