@@ -18,6 +18,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 
 let nextResults: unknown[] = [];
 let nextMeta: Record<string, unknown> | null = null;
+let lastHybridOpts: Record<string, unknown> | null = null;
 
 // Mock BEFORE importing dispatch (operations.ts binds hybridSearchCached at
 // import time; the spread keeps every other export live).
@@ -26,8 +27,9 @@ mock.module('../src/core/search/hybrid.ts', () => ({
   hybridSearchCached: async (
     _engine: unknown,
     _query: string,
-    opts: { onMeta?: (m: unknown) => void },
+    opts: { onMeta?: (m: unknown) => void } & Record<string, unknown>,
   ) => {
+    lastHybridOpts = opts;
     if (nextMeta) opts.onMeta?.(nextMeta);
     return nextResults;
   },
@@ -48,8 +50,11 @@ const DEGRADED_META = {
   degraded: [{ stage: 'embed_unavailable' }],
 };
 
-function callSearch(metaHook?: () => Promise<Record<string, unknown> | undefined>) {
-  return dispatchToolCall(engineStub, 'search', { query: 'anything at all' }, {
+function callSearch(
+  params: Record<string, unknown> = {},
+  metaHook?: () => Promise<Record<string, unknown> | undefined>,
+) {
+  return dispatchToolCall(engineStub, 'search', { query: 'anything at all', ...params }, {
     remote: true,
     transport: 'http',
     sourceId: 'default',
@@ -99,17 +104,36 @@ describe('dispatch response meta (WP2/D3/D8)', () => {
   test('metaHook failure never drops the retrieval key (per-key isolation)', async () => {
     nextResults = [];
     nextMeta = DEGRADED_META;
-    const out = await callSearch(async () => { throw new Error('hot memory down'); });
+    const out = await callSearch({}, async () => { throw new Error('hot memory down'); });
     expect((out._meta as Record<string, any>).retrieval).toBeDefined();
   });
 
   test('metaHook keys merge alongside retrieval, not over it', async () => {
     nextResults = [];
     nextMeta = DEGRADED_META;
-    const out = await callSearch(async () => ({ brain_hot_memory: { facts: [] } }));
+    const out = await callSearch({}, async () => ({ brain_hot_memory: { facts: [] } }));
     const meta = out._meta as Record<string, any>;
     expect(meta.retrieval).toBeDefined();
     expect(meta.brain_hot_memory).toEqual({ facts: [] });
+  });
+
+  test('empty optional types array is omitted while malformed types stay invalid', async () => {
+    nextResults = [];
+    nextMeta = { vector_enabled: true, expansion_applied: false, detail_resolved: null };
+    lastHybridOpts = null;
+
+    const empty = await callSearch({ types: [] });
+    expect(empty.isError).toBeUndefined();
+    expect(lastHybridOpts).toBeDefined();
+    expect('types' in lastHybridOpts!).toBe(false);
+
+    const malformed = await callSearch({ types: [42] });
+    expect(malformed.isError).toBe(true);
+    expect(JSON.parse(malformed.content[0].text).error).toBe('invalid_params');
+
+    const blankOnly = await callSearch({ types: ['  '] });
+    expect(blankOnly.isError).toBe(true);
+    expect(JSON.parse(blankOnly.content[0].text).error).toBe('invalid_params');
   });
 });
 
