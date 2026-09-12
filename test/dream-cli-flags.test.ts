@@ -24,6 +24,11 @@ describe('dream CLI flag wiring', () => {
     expect(dreamSrc).toContain("'--to'");
   });
 
+  test('declares --json-out dedicated CycleReport file flag', () => {
+    expect(dreamSrc).toContain("'--json-out'");
+    expect(dreamSrc).toContain('writeCycleReportJsonAtomic');
+  });
+
   test('validates ISO date format', () => {
     expect(dreamSrc).toMatch(/ISO_DATE_RE/);
     expect(dreamSrc).toContain('YYYY-MM-DD');
