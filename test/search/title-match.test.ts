@@ -28,10 +28,15 @@ describe('isTitlePhraseMatch — positive (the incident)', () => {
     expect(isTitlePhraseMatch('the hall of light', 'The Hall of Light')).toBe(true);
   });
   test('named title inside a longer qualified query', () => {
-    expect(isTitlePhraseMatch('Trevor Goertzen meetings', 'Trevor Goertzen')).toBe(true);
+    expect(isTitlePhraseMatch('Trevor Goertzen meetings', 'Trevor Goertzen', {
+      qualified: true,
+      namedEntity: true,
+    })).toBe(true);
   });
   test('multi-token concept title inside a longer query', () => {
-    expect(isTitlePhraseMatch('renewal risk enrollment decline', 'risk enrollment decline')).toBe(true);
+    expect(isTitlePhraseMatch('renewal risk enrollment decline', 'risk enrollment decline', {
+      qualified: true,
+    })).toBe(true);
   });
 });
 
@@ -46,6 +51,14 @@ describe('isTitlePhraseMatch — negative (precision guard)', () => {
   });
   test('single-token title inside a longer query does NOT match', () => {
     expect(isTitlePhraseMatch('Milbank budget objection', 'Milbank')).toBe(false);
+  });
+  test('qualified containment is opt-in', () => {
+    expect(isTitlePhraseMatch('Trevor Goertzen meetings', 'Trevor Goertzen')).toBe(false);
+  });
+  test('generic two-token concept title does NOT become a ranking magnet', () => {
+    expect(isTitlePhraseMatch('IEP special education product requests', 'Special Education', {
+      qualified: true,
+    })).toBe(false);
   });
   test('non-contiguous tokens do NOT match (phrase, not bag-of-words)', () => {
     // "greek" and "indoor" both present but not contiguous in query order.
@@ -73,5 +86,8 @@ describe('tokenizeTitle', () => {
   });
   test('MIN_CONTENT_TOKENS is 2 (the precision floor)', () => {
     expect(__test__.MIN_CONTENT_TOKENS).toBe(2);
+  });
+  test('qualified non-entity titles require 3 content tokens', () => {
+    expect(__test__.MIN_QUALIFIED_CONTENT_TOKENS).toBe(3);
   });
 });

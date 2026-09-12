@@ -616,6 +616,39 @@ describe('runPostFusionStages — single-baseline composition (D6/T2)', () => {
     expect(results[1].score).toBeGreaterThan(0.3); // weak got boosted, no gate
   });
 
+  test('title floor is removed only by the qualified per-brain opt-in', async () => {
+    const engine = makeStubEngine({});
+    const off: SearchResult[] = [
+      makeResult({ slug: 'strong', title: 'Other', score: 1.0, source_id: undefined }),
+      makeResult({ slug: 'weak', title: 'Trevor Goertzen', score: 0.3, source_id: undefined, type: 'person' }),
+    ];
+    await runPostFusionStages(engine as any, off, {
+      applyBacklinks: false,
+      salience: 'off',
+      recency: 'off',
+      floorRatio: 0.85,
+      query: 'Trevor Goertzen meetings',
+      titleBoost: 1.25,
+      titleQualified: false,
+    });
+    expect(off[1].score).toBe(0.3);
+
+    const on: SearchResult[] = [
+      makeResult({ slug: 'strong', title: 'Other', score: 1.0, source_id: undefined }),
+      makeResult({ slug: 'weak', title: 'Trevor Goertzen', score: 0.3, source_id: undefined, type: 'person' }),
+    ];
+    await runPostFusionStages(engine as any, on, {
+      applyBacklinks: false,
+      salience: 'off',
+      recency: 'off',
+      floorRatio: 0.85,
+      query: 'Trevor Goertzen meetings',
+      titleBoost: 1.25,
+      titleQualified: true,
+    });
+    expect(on[1].score).toBeCloseTo(0.3 * 1.25, 6);
+  });
+
   test('empty results: no-op, no divide-by-zero, no engine calls', async () => {
     let engineCalls = 0;
     const engine = {

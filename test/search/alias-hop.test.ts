@@ -120,9 +120,24 @@ describe('applyAliasHop', () => {
       engine,
       [res('notes/unrelated', 0.5)],
       'company value about connecting evidence across teams',
-      { sourceId: 'default' },
+      { sourceId: 'default', qualified: true },
     );
     expect(out[0].slug).toBe('values/connect-the-dots');
+    expect(out[0].alias_hit).toBe(true);
+  });
+
+  test('qualified alias promotion is independent of organic pool inclusion', async () => {
+    await engine.putPage('values/connect-the-dots', { type: 'concept', title: 'Connect the Dots', compiled_truth: 'x' });
+    await engine.setPageAliases('values/connect-the-dots', 'default', ['connecting evidence across teams']);
+    const out = await applyAliasHop(
+      engine,
+      [res('notes/strong', 0.9), res('values/connect-the-dots', 0.2)],
+      'company value about connecting evidence across teams',
+      { sourceId: 'default', qualified: true },
+    );
+    expect(out.filter(r => r.slug === 'values/connect-the-dots')).toHaveLength(1);
+    expect(out[0].slug).toBe('values/connect-the-dots');
+    expect(out[0].score).toBeGreaterThan(0.9);
     expect(out[0].alias_hit).toBe(true);
   });
 
@@ -133,7 +148,7 @@ describe('applyAliasHop', () => {
       engine,
       [],
       'what did we learn about customer trust last quarter',
-      { sourceId: 'default' },
+      { sourceId: 'default', qualified: true },
     );
     expect(out).toEqual([]);
   });
@@ -147,7 +162,59 @@ describe('applyAliasHop', () => {
       engine,
       [],
       'company value about connecting evidence across teams',
+      { sourceId: 'default', qualified: true },
+    );
+    expect(out).toEqual([]);
+  });
+
+  test('qualified aliases are opt-in', async () => {
+    await engine.putPage('values/connect-the-dots', { type: 'concept', title: 'Connect the Dots', compiled_truth: 'x' });
+    await engine.setPageAliases('values/connect-the-dots', 'default', ['connecting evidence across teams']);
+    const out = await applyAliasHop(
+      engine,
+      [],
+      'company value about connecting evidence across teams',
       { sourceId: 'default' },
+    );
+    expect(out).toEqual([]);
+  });
+
+  test('stopword-heavy qualified alias is rejected', async () => {
+    await engine.putPage('concepts/box', { type: 'concept', title: 'Box', compiled_truth: 'x' });
+    await engine.setPageAliases('concepts/box', 'default', ['out of the box']);
+    const out = await applyAliasHop(
+      engine,
+      [],
+      'what works out of the box for teachers',
+      { sourceId: 'default', qualified: true },
+    );
+    expect(out).toEqual([]);
+  });
+
+  test('leading stopword-heavy n-gram in a 7+ token query is rejected', async () => {
+    await engine.putPage('concepts/box', { type: 'concept', title: 'Box', compiled_truth: 'x' });
+    await engine.setPageAliases('concepts/box', 'default', ['the and of to in for']);
+    const out = await applyAliasHop(
+      engine,
+      [],
+      'the and of to in for teachers everywhere',
+      { sourceId: 'default', qualified: true },
+    );
+    expect(out).toEqual([]);
+  });
+
+  test('ambiguous longer phrase suppresses an unambiguous contained fallback', async () => {
+    await engine.putPage('a/value', { type: 'concept', title: 'A', compiled_truth: 'x' });
+    await engine.putPage('b/value', { type: 'concept', title: 'B', compiled_truth: 'x' });
+    await engine.putPage('c/value', { type: 'concept', title: 'C', compiled_truth: 'x' });
+    await engine.setPageAliases('a/value', 'default', ['connecting evidence across teams']);
+    await engine.setPageAliases('b/value', 'default', ['connecting evidence across teams']);
+    await engine.setPageAliases('c/value', 'default', ['evidence across teams']);
+    const out = await applyAliasHop(
+      engine,
+      [],
+      'company value about connecting evidence across teams',
+      { sourceId: 'default', qualified: true },
     );
     expect(out).toEqual([]);
   });

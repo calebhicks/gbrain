@@ -20,6 +20,7 @@
  */
 
 const MIN_CONTENT_TOKENS = 2;
+const MIN_QUALIFIED_CONTENT_TOKENS = 3;
 
 // Small, deliberately conservative English stopword set. CJK has no whitespace
 // stopword notion here; CJK queries fall through to the exact-match path.
@@ -48,6 +49,11 @@ function contentTokens(tokens: string[]): string[] {
   return tokens.filter(t => !STOPWORDS.has(t));
 }
 
+/** Public precision guard shared by title and alias qualified-prose paths. */
+export function contentTokenCount(text: string): number {
+  return contentTokens(tokenizeTitle(text)).length;
+}
+
 /** True iff `needle` appears as a contiguous token run inside `haystack`. */
 function containsTokenRun(haystack: string[], needle: string[]): boolean {
   if (needle.length === 0 || needle.length > haystack.length) return false;
@@ -67,8 +73,9 @@ function containsTokenRun(haystack: string[], needle: string[]): boolean {
  * Returns true when EITHER:
  *   (a) the normalized query token sequence is a contiguous run inside the
  *       normalized title AND the query has >= MIN_CONTENT_TOKENS content tokens; OR
- *   (b) the normalized title token sequence is a contiguous run inside the
- *       normalized query AND the title has >= MIN_CONTENT_TOKENS content tokens; OR
+ *   (b) qualified matching is enabled and the normalized title token sequence
+ *       is a contiguous run inside the normalized query, with >=3 content
+ *       tokens (or >=2 for named entities); OR
  *   (c) the normalized query equals the full normalized title exactly (covers
  *       deliberate single-word titles / chosen names like "Mingtang").
  *
@@ -76,7 +83,11 @@ function containsTokenRun(haystack: string[], needle: string[]): boolean {
  * should reflect the author's phrasing, and bag-of-words matching is what the
  * vector/keyword paths already provide.
  */
-export function isTitlePhraseMatch(query: string, title: string): boolean {
+export function isTitlePhraseMatch(
+  query: string,
+  title: string,
+  opts: { qualified?: boolean; namedEntity?: boolean } = {},
+): boolean {
   const qTokens = tokenizeTitle(query);
   const tTokens = tokenizeTitle(title);
   if (qTokens.length === 0 || tTokens.length === 0) return false;
@@ -96,9 +107,20 @@ export function isTitlePhraseMatch(query: string, title: string): boolean {
   // agent shape ("Trevor Goertzen meetings", "renewal risk enrollment
   // decline") that the original one-way matcher missed. The same two-content-
   // token floor prevents generic one-word titles from gaining authority.
+  if (!opts.qualified) return false;
   const tContent = contentTokens(tTokens);
-  return tContent.length >= MIN_CONTENT_TOKENS && containsTokenRun(qTokens, tTokens);
+  const qualifiedFloor = opts.namedEntity
+    ? MIN_CONTENT_TOKENS
+    : MIN_QUALIFIED_CONTENT_TOKENS;
+  return tContent.length >= qualifiedFloor && containsTokenRun(qTokens, tTokens);
 }
 
 // Exported for unit tests.
-export const __test__ = { tokenizeTitle, contentTokens, containsTokenRun, STOPWORDS, MIN_CONTENT_TOKENS };
+export const __test__ = {
+  tokenizeTitle,
+  contentTokens,
+  containsTokenRun,
+  STOPWORDS,
+  MIN_CONTENT_TOKENS,
+  MIN_QUALIFIED_CONTENT_TOKENS,
+};

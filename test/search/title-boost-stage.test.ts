@@ -8,10 +8,10 @@ import { describe, test, expect } from 'bun:test';
 import { applyTitleBoost, DEFAULT_TITLE_BOOST } from '../../src/core/search/hybrid.ts';
 import type { SearchResult } from '../../src/core/types.ts';
 
-function mk(slug: string, title: string, score: number): SearchResult {
+function mk(slug: string, title: string, score: number, type = 'note'): SearchResult {
   return {
     slug, title, score,
-    chunk_text: '', type: 'note', source_id: 'default',
+    chunk_text: '', type, source_id: 'default',
     chunk_index: 0, chunk_id: 1,
   } as unknown as SearchResult;
 }
@@ -52,5 +52,29 @@ describe('applyTitleBoost', () => {
     const r = mk('projects/mingtang', 'Greek Amphitheater', 0.8);
     applyTitleBoost([r], '', DEFAULT_TITLE_BOOST);
     expect(r.score).toBe(0.8);
+  });
+
+  test('qualified title containment is opt-in and preserves named entities', () => {
+    const off = mk('people/trevor-goertzen', 'Trevor Goertzen', 0.5, 'person');
+    applyTitleBoost([off], 'Trevor Goertzen meetings', DEFAULT_TITLE_BOOST);
+    expect(off.score).toBe(0.5);
+
+    const on = mk('people/trevor-goertzen', 'Trevor Goertzen', 0.5, 'person');
+    applyTitleBoost([on], 'Trevor Goertzen meetings', DEFAULT_TITLE_BOOST, undefined, true);
+    expect(on.score).toBeCloseTo(0.625, 6);
+  });
+
+  test('qualified generic two-token concepts do not receive the production boost', () => {
+    const r = mk('concepts/special-education', 'Special Education', 0.5, 'concept');
+    applyTitleBoost([r], 'IEP special education product requests', DEFAULT_TITLE_BOOST, undefined, true);
+    expect(r.score).toBe(0.5);
+    expect(r.title_match_boost).toBeUndefined();
+  });
+
+  test('qualified opt-in does not bypass the floor for a legacy forward match', () => {
+    const r = mk('people/trevor-goertzen', 'Trevor Goertzen Profile', 0.3, 'person');
+    applyTitleBoost([r], 'Trevor Goertzen', DEFAULT_TITLE_BOOST, 0.85, true);
+    expect(r.score).toBe(0.3);
+    expect(r.title_match_boost).toBeUndefined();
   });
 });

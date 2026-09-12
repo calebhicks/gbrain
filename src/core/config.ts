@@ -1311,6 +1311,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.cache.ttl_seconds',
   'search.token_budget',
   'search.expansion',
+  'search.title_qualified',
+  'search.qualified_aliases',
   'search.intent_weighting',
   'search.limit_default',
   'search.mode_upgrade_notice_shown',

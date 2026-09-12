@@ -36,6 +36,8 @@ export const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   reranker_timeout_ms: 'HTTP timeout for the reranker call',
   floor_ratio: 'Floor-ratio gate for metadata boosts (0..1, undefined = off)',
   title_boost: 'Title-phrase boost multiplier (query is a title token-run; 1.0 = off)',
+  titleQualified: 'Page title may match inside qualified prose (per-brain opt-in)',
+  qualifiedAliases: 'Declared 3–6-token aliases may match inside qualified prose (per-brain opt-in)',
   // v0.46.15 retrieval wave knobs
   evidence_cosine_floor: 'Cosine floor for evidence high_vector_match (label-only; 0..1)',
   autocut_min_top: 'Weak-top floor — autocut no-ops when the top score is below this (0 disables)',
