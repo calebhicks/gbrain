@@ -204,6 +204,12 @@ export interface ModeBundle {
    */
   title_boost: number | undefined;
 
+  /** Reverse title containment inside qualified prose; opt-in per brain. */
+  titleQualified: boolean;
+
+  /** Contained 3–6-token ontology aliases inside qualified prose; opt-in per brain. */
+  qualifiedAliases: boolean;
+
   /**
    * v0.46.15 — cosine floor for evidence's `high_vector_match` (see
    * evidence.ts DEFAULT_HIGH_COSINE_FLOOR). Config `search.evidence_cosine_floor`.
@@ -448,6 +454,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    titleQualified: false,
+    qualifiedAliases: false,
     evidence_cosine_floor: 0.8,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
@@ -514,6 +522,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    titleQualified: false,
+    qualifiedAliases: false,
     evidence_cosine_floor: 0.8,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
@@ -581,6 +591,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    titleQualified: false,
+    qualifiedAliases: false,
     evidence_cosine_floor: 0.8,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
@@ -650,6 +662,8 @@ export interface SearchKeyOverrides {
   floor_ratio?: number;
   // T2 — title-phrase boost override.
   title_boost?: number;
+  titleQualified?: boolean;
+  qualifiedAliases?: boolean;
   // v0.46.15 — evidence cosine-floor override (label-only; not in knobsHash).
   evidence_cosine_floor?: number;
   // v0.36 cross-modal overrides
@@ -707,6 +721,8 @@ export interface SearchPerCallOpts {
   floor_ratio?: number;
   // T2 — title-phrase boost per-call override.
   title_boost?: number;
+  titleQualified?: boolean;
+  qualifiedAliases?: boolean;
   // v0.46.15 — evidence cosine-floor per-call override.
   evidence_cosine_floor?: number;
   // v0.36 cross-modal per-call overrides
@@ -817,6 +833,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     // v0.35.6.0 — floor-ratio resolved via the same pick chain.
     floor_ratio: pick('floor_ratio'),
     title_boost: pick('title_boost'),
+    titleQualified: pick('titleQualified'),
+    qualifiedAliases: pick('qualifiedAliases'),
     evidence_cosine_floor: pick('evidence_cosine_floor'),
     // v0.36 cross-modal knobs
     cross_modal_both_text_weight: pick('cross_modal_both_text_weight'),
@@ -1283,6 +1301,8 @@ export function knobsHash(
     `crd=${knobs.contextual_retrieval_disabled ? 1 : 0}`,
     // v=7 addition (append-only) — T2 title-phrase boost (retrieval-maxpool).
     `tib=${knobs.title_boost === undefined ? 'none' : knobs.title_boost.toFixed(4)}`,
+    `tiq=${knobs.titleQualified ? 1 : 0}`,
+    `qal=${knobs.qualifiedAliases ? 1 : 0}`,
     // v=8 additions (v0.42.3.0, append-only): autocut. An autocut-on write
     // (trimmed result set) must not be served to an autocut-off lookup, and a
     // sensitivity change (jumpRatio) shifts where the cut lands. Conservative
@@ -1515,6 +1535,14 @@ export function loadOverridesFromConfig(
     const n = parseFloat(tib);
     if (Number.isFinite(n) && n >= 1.0 && n <= 5.0) out.title_boost = n;
   }
+  const tiq = get('search.title_qualified');
+  if (tiq !== undefined) {
+    out.titleQualified = tiq === '1' || tiq.toLowerCase() === 'true';
+  }
+  const qal = get('search.qualified_aliases');
+  if (qal !== undefined) {
+    out.qualifiedAliases = qal === '1' || qal.toLowerCase() === 'true';
+  }
 
   // v0.46.15 — evidence cosine floor (label-only knob; deliberately not in
   // knobsHash). [0, 1] sanity-bounded.
@@ -1663,6 +1691,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   // v0.35.6.0 — floor-ratio gate
   'search.floor_ratio',
   'search.title_boost',
+  'search.title_qualified',
+  'search.qualified_aliases',
   'search.evidence_cosine_floor',
   // v0.36 cross-modal keys (D3)
   'search.cross_modal.both_mode_text_weight',
@@ -1749,4 +1779,3 @@ export async function loadSearchModeConfig(
     overrides: loadOverridesFromConfig(configMap),
   };
 }
-

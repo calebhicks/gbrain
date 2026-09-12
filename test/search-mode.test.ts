@@ -73,6 +73,8 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      titleQualified: false,
+      qualifiedAliases: false,
       evidence_cosine_floor: 0.8,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: false,
@@ -116,6 +118,8 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      titleQualified: false,
+      qualifiedAliases: false,
       evidence_cosine_floor: 0.8,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
@@ -157,6 +161,8 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      titleQualified: false,
+      qualifiedAliases: false,
       evidence_cosine_floor: 0.8,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
@@ -903,6 +909,38 @@ describe('v0.43 — relational recall knobs', () => {
     const on = knobsHash(resolveSearchMode({ mode: 'balanced' })); // relational true
     const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relationalRetrieval: false } }));
     expect(on).not.toBe(off);
+  });
+});
+
+describe('qualified retrieval rollout knobs', () => {
+  test('default off; config and per-call resolve independently', () => {
+    const base = resolveSearchMode({ mode: 'balanced' });
+    expect(base.titleQualified).toBe(false);
+    expect(base.qualifiedAliases).toBe(false);
+
+    const configured = resolveSearchMode({
+      mode: 'balanced',
+      overrides: loadOverridesFromConfig({
+        'search.title_qualified': 'true',
+        'search.qualified_aliases': '1',
+      }),
+      perCall: { qualifiedAliases: false },
+    });
+    expect(configured.titleQualified).toBe(true);
+    expect(configured.qualifiedAliases).toBe(false);
+  });
+
+  test('both flags participate in the cache key', () => {
+    const base = resolveSearchMode({ mode: 'balanced' });
+    const titleOn = resolveSearchMode({ mode: 'balanced', perCall: { titleQualified: true } });
+    const aliasOn = resolveSearchMode({ mode: 'balanced', perCall: { qualifiedAliases: true } });
+    expect(knobsHash(base)).not.toBe(knobsHash(titleOn));
+    expect(knobsHash(base)).not.toBe(knobsHash(aliasOn));
+  });
+
+  test('reset registry includes both config keys', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.title_qualified');
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.qualified_aliases');
   });
 });
 

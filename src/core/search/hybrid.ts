@@ -51,7 +51,7 @@ import {
   loadEngineIntentPatterns,
   type QuerySuggestions,
 } from './query-intent.ts';
-import { isTitlePhraseMatch } from './title-match.ts';
+import { contentTokenCount, isTitlePhraseMatch } from './title-match.ts';
 import {
   pushVectorList,
   composeFusionLists,
@@ -435,14 +435,15 @@ export function applyRecencyBoost(
  * T2 (retrieval-maxpool incident) — apply the title-phrase boost.
  *
  * Fires when the normalized query is a contiguous token-run inside a result's
- * page title, the multi-token title is a contiguous run inside a qualified
- * query, or both are exact, per `isTitlePhraseMatch`. Mutate-in-place; caller
- * re-sorts.
+ * page title, or (when the per-brain qualified flag is on) the page title is a
+ * sufficiently specific contiguous run inside qualified prose. Mutate-in-place;
+ * caller re-sorts.
  *
- * Bounded by construction: a single fixed multiplier (`factor`, default 1.25),
- * The optional floor remains for direct callers, but the production stage does
- * not apply the metadata-authority floor: title wording is direct lexical
- * relevance evidence. `base_score` (stamped at runPostFusionStages entry) is
+ * Bounded by construction: a single fixed multiplier (`factor`, default 1.25).
+ * The optional floor remains for direct callers and for the legacy forward
+ * matcher. An opted-in qualified match does not apply the metadata-authority
+ * floor: contained title wording is direct lexical relevance evidence.
+ * `base_score` (stamped at runPostFusionStages entry) is
  * NOT touched, so the agent's dedup gate still reads true match confidence.
  *
  * Why page.title and not "first compiled_truth chunk" (Codex#11): the title is
@@ -454,13 +455,26 @@ export function applyTitleBoost(
   query: string,
   factor: number,
   floorThreshold?: number,
+  qualified = false,
 ): void {
   if (!query || !Number.isFinite(factor) || factor <= 1.0) return;
   for (const r of results) {
     if (!Number.isFinite(r.score)) continue;
-    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     if (!r.title) continue;
-    if (isTitlePhraseMatch(query, r.title)) {
+    const namedEntity = r.type === 'person' || r.type === 'company';
+    const legacyMatch = isTitlePhraseMatch(query, r.title, {
+      qualified: false,
+      namedEntity,
+    });
+    const qualifiedMatch = qualified && !legacyMatch && isTitlePhraseMatch(query, r.title, {
+      qualified: true,
+      namedEntity,
+    });
+    if (!legacyMatch && !qualifiedMatch) continue;
+    // The flag opens only the reverse contained-title path. Forward matches
+    // retain the historical floor even while that flag is enabled.
+    if (!qualifiedMatch && floorThreshold !== undefined && r.score < floorThreshold) continue;
+    if (legacyMatch || qualifiedMatch) {
       r.score *= factor;
       r.title_match_boost = factor; // attribution stamp (v0.40.4 convention)
     }
@@ -563,6 +577,8 @@ export interface PostFusionOpts extends PageReadPolicy {
    * metadata stages so a title hit can't bury a strong semantic match.
    */
   titleBoost?: number;
+  /** Opt-in reverse title matching (page title contained in qualified prose). */
+  titleQualified?: boolean;
   /**
    * Ranker wave (Phase E3, Cat 13) — `search.metadata_boost_gate = lexical`
    * resolved to "the vector arm was the only voter" (metadata-boost-gate.ts).
@@ -662,14 +678,14 @@ export async function runPostFusionStages(
   }
 
   // T2 — title-phrase boost. Runs after the metadata stages, before graph
-  // signals. Unlike metadata authority signals, an exact multi-token title
-  // phrase is direct lexical relevance evidence, so it must not inherit the
-  // metadata floor: doing so made the strongest named-page candidate
-  // ineligible precisely when semantic fusion initially ranked it too low.
-  // The matcher itself carries the two-content-token precision guard.
+  // signals. Preserve the historical floor when qualified matching is off.
+  // With the per-brain flag on, a contained multi-token title is direct
+  // lexical relevance evidence and may clear that floor.
+  // The matcher carries a three-content-token qualified floor, with a narrow
+  // two-token exception for named person/company entities.
   if (opts.query && opts.titleBoost && opts.titleBoost > 1.0) {
     try {
-      applyTitleBoost(results, opts.query, opts.titleBoost);
+      applyTitleBoost(results, opts.query, opts.titleBoost, floorThreshold, opts.titleQualified);
     } catch {
       // Non-fatal; preserves the per-stage contract.
     }
@@ -911,11 +927,11 @@ const MAX_ALIAS_INJECT = 3;           // cap injected pages per query (collision
  * about connecting evidence across teams") without turning one- or two-word
  * aliases into ambient keyword boosts.
  */
-function aliasQueryCandidates(qNorm: string): string[] {
+function aliasQueryCandidates(qNorm: string, qualified: boolean): string[] {
   const tokens = qNorm.split(' ').filter(Boolean);
   const out: string[] = [];
   if (tokens.length <= MAX_ALIAS_QUERY_TOKENS) out.push(qNorm);
-  if (tokens.length < MIN_QUALIFIED_ALIAS_TOKENS || tokens.length > MAX_QUALIFIED_QUERY_TOKENS) {
+  if (!qualified || tokens.length < MIN_QUALIFIED_ALIAS_TOKENS || tokens.length > MAX_QUALIFIED_QUERY_TOKENS) {
     return out;
   }
   for (let size = Math.min(MAX_ALIAS_QUERY_TOKENS, tokens.length - 1); size >= MIN_QUALIFIED_ALIAS_TOKENS; size--) {
@@ -923,7 +939,8 @@ function aliasQueryCandidates(qNorm: string): string[] {
       out.push(tokens.slice(start, start + size).join(' '));
     }
   }
-  return [...new Set(out)];
+  return [...new Set(out)].filter(candidate =>
+    candidate === qNorm || contentTokenCount(candidate) >= MIN_QUALIFIED_ALIAS_TOKENS);
 }
 
 /**
@@ -952,12 +969,12 @@ export async function applyAliasHop(
   engine: import('../engine.ts').BrainEngine,
   results: SearchResult[],
   query: string,
-  opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean },
+  opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; qualified?: boolean },
 ): Promise<SearchResult[]> {
   if (!query) return results;
   const qNorm = normalizeAlias(query);
   if (!qNorm) return results;
-  const candidates = aliasQueryCandidates(qNorm);
+  const candidates = aliasQueryCandidates(qNorm, opts.qualified ?? false);
   if (candidates.length === 0) return results;
 
   let aliasMap: Map<string, Array<{ slug: string; source_id: string }>>;
@@ -969,11 +986,20 @@ export async function applyAliasHop(
   const exactRefs = candidates[0] === qNorm ? aliasMap.get(qNorm) : undefined;
   // Exact aliases retain collision behavior. Qualified aliases are stricter:
   // take the longest/leftmost phrase that resolves to one canonical page.
-  const refs = exactRefs?.length
-    ? exactRefs
-    : candidates.slice(candidates[0] === qNorm ? 1 : 0)
-        .map(norm => aliasMap.get(norm))
-        .find(hits => hits?.length === 1);
+  let refs = exactRefs?.length ? exactRefs : undefined;
+  let qualifiedMatch = false;
+  if (!refs) {
+    for (const candidate of candidates.slice(candidates[0] === qNorm ? 1 : 0)) {
+      const hits = aliasMap.get(candidate);
+      if (!hits?.length) continue;
+      // A contested specific phrase suppresses the qualified hop. Falling
+      // through to a shorter phrase would turn ambiguity into vaguer routing.
+      if (hits.length !== 1) return results;
+      refs = hits;
+      qualifiedMatch = true;
+      break;
+    }
+  }
   if (!refs || refs.length === 0) return results;
 
   // Deterministic + capped. Source-scoped: each canonical is a (source_id, slug)
@@ -989,7 +1015,17 @@ export async function applyAliasHop(
   for (const ref of ordered) {
     const idx = out.findIndex(r => r.slug === ref.slug && (r.source_id ?? 'default') === ref.source_id);
     if (idx >= 0) {
-      if (Number.isFinite(out[idx].score)) out[idx].score *= ALIAS_HOP_PRESENT_BOOST;
+      if (Number.isFinite(out[idx].score)) {
+        const boosted = out[idx].score * ALIAS_HOP_PRESENT_BOOST;
+        // A contained alias is one unambiguous lexical routing decision. Its
+        // rank must not depend on whether fusion happened to include the page
+        // at the tail: absent pages are injected above organic rank 1, so an
+        // already-present page gets the same floor. Keep exact-query alias
+        // collisions on the historical bounded 1.10x behavior.
+        out[idx].score = qualifiedMatch
+          ? Math.max(boosted, injectScore += 1e-6)
+          : boosted;
+      }
       out[idx].alias_hit = true;
       continue;
     }
@@ -1033,6 +1069,10 @@ export async function applyAliasHop(
 
 export interface HybridSearchOpts extends SearchOpts {
   expansion?: boolean;
+  /** Opt in to contained aliases in qualified natural-language questions. */
+  qualifiedAliases?: boolean;
+  /** Opt in to page-title containment inside qualified natural-language questions. */
+  titleQualified?: boolean;
   /** v0.43 — observability sink for the relational recall arm (fired/no-op,
    *  kind, seeds resolved, candidates, errored). Best-effort. */
   onRelationalMeta?: (meta: import('./relational-recall.ts').RelationalArmMeta) => void;
@@ -1306,6 +1346,8 @@ export async function hybridSearch(
       intentWeighting: opts?.intentWeighting,
       tokenBudget: opts?.tokenBudget,
       expansion: opts?.expansion,
+      qualifiedAliases: opts?.qualifiedAliases,
+      titleQualified: opts?.titleQualified,
       searchLimit: opts?.limit,
       // v0.35.6.0 — floor-ratio gate thread-through. Per-call value wins
       // over per-key config wins over mode bundle (currently undefined for
@@ -1580,6 +1622,7 @@ export async function hybridSearch(
     // The raw query drives the matcher; default factor when the knob is unset.
     query,
     titleBoost: resolvedMode.title_boost,
+    titleQualified: resolvedMode.titleQualified,
   };
 
   // v0.43 — build the relational recall arm ONCE here, before any return
@@ -1665,6 +1708,7 @@ export async function hybridSearch(
       sourceIds: opts?.sourceIds,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
+      qualified: resolvedMode.qualifiedAliases,
     });
     // #1663 — structural exact-lookup tier (slug / exact-title identity).
     const noEmbedHopped = await applyExactLookupTier(engine, noEmbedPreExact, query, {
@@ -2081,6 +2125,7 @@ export async function hybridSearch(
       sourceIds: opts?.sourceIds,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
+      qualified: resolvedMode.qualifiedAliases,
     });
     // #1663 — structural exact-lookup tier (slug / exact-title identity).
     const kwHopped = await applyExactLookupTier(engine, kwPreExact, query, {
@@ -2376,6 +2421,7 @@ export async function hybridSearch(
     sourceIds: opts?.sourceIds,
     excludePrivate: opts?.excludePrivate,
     requireSafeChunks: opts?.requireSafeChunks,
+    qualified: resolvedMode.qualifiedAliases,
   });
 
   // #1663 — structural exact-lookup tier: a query that IS a page identity
@@ -2612,6 +2658,8 @@ export async function hybridSearchCached(
       cache_enabled: opts?.useCache,
       tokenBudget: opts?.tokenBudget,
       expansion: opts?.expansion,
+      qualifiedAliases: opts?.qualifiedAliases,
+      titleQualified: opts?.titleQualified,
       intentWeighting: opts?.intentWeighting,
       searchLimit: opts?.limit,
       // v0.35.6.0 — floor-ratio threaded through cache resolver too so
