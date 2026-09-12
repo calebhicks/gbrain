@@ -34,11 +34,12 @@ import {
 import { ALL_SOURCES, isResolverUserError, resolveImplicitDefaultSourceId, resolveSourceId } from '../core/source-resolver.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { fetchSource } from '../core/sources-load.ts';
-import { existsSync } from 'fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
+import { basename, dirname, join, resolve } from 'node:path';
 
 interface DreamArgs {
   json: boolean;
+  jsonOut: string | null;
   dryRun: boolean;
   pull: boolean;
   /**
@@ -103,6 +104,23 @@ const DEFAULT_DRAIN_WINDOW_SECONDS = 300;
 /** Exit code for "drain ran but the backlog isn't empty — run again". */
 const EXIT_DRAIN_INCOMPLETE = 3;
 
+function writeCycleReportJsonAtomic(path: string, report: CycleReport): void {
+  const outPath = resolve(path);
+  const parent = dirname(outPath);
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  if (existsSync(outPath) && statSync(outPath).isDirectory()) {
+    throw new Error(`--json-out destination is a directory: ${outPath}`);
+  }
+  const tmpPath = join(parent, `.${basename(outPath)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    writeFileSync(tmpPath, JSON.stringify(report, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    renameSync(tmpPath, outPath);
+  } catch (err) {
+    rmSync(tmpPath, { force: true });
+    throw err;
+  }
+}
+
 /**
  * Collect every occurrence of `--<flag> <value>` in argv. Used to
  * detect repeated flags with different values (e.g.
@@ -153,6 +171,18 @@ function parseArgs(args: string[]): DreamArgs {
 
   const dirIdx = args.indexOf('--dir');
   const dir = dirIdx !== -1 ? args[dirIdx + 1] : null;
+
+  const jsonOutValues = collectFlagValues(args, '--json-out');
+  if (jsonOutValues === null) {
+    console.error('--json-out <path>: missing value. Usage: gbrain dream --json-out <cycle-report.json>');
+    process.exit(2);
+  }
+  const uniqJsonOut = Array.from(new Set(jsonOutValues));
+  if (uniqJsonOut.length > 1) {
+    console.error(`specify --json-out once; got [${uniqJsonOut.map(v => `"${v}"`).join(', ')}]`);
+    process.exit(2);
+  }
+  const jsonOut = uniqJsonOut[0] ?? null;
 
   const inputIdx = args.indexOf('--input');
   const inputFile = inputIdx !== -1 ? args[inputIdx + 1] ?? null : null;
@@ -292,6 +322,7 @@ function parseArgs(args: string[]): DreamArgs {
 
   return {
     json: args.includes('--json'),
+    jsonOut,
     dryRun: args.includes('--dry-run'),
     pull: args.includes('--pull'),
     phases,
@@ -394,6 +425,9 @@ Options:
                       but skips the synthesis subagents.
                       "--dry-run" does NOT mean "zero LLM calls."
   --json              Emit the CycleReport as JSON (agent-readable)
+  --json-out <path>   Write the CycleReport as clean JSON to a dedicated
+                      file, atomically. Progress and human output may still
+                      use stdout/stderr; this file contains only the report.
   --phase <name>      Run only the named phase(s). Repeatable — every named
                       phase runs, in canonical cycle order (#4493).
                       Valid: ${ALL_PHASES.join(' | ')}
@@ -459,6 +493,7 @@ Options:
 Examples:
   gbrain dream
   gbrain dream --dry-run --json
+  gbrain dream --json-out /var/log/gbrain/dream-cycle.json
   gbrain dream --phase lint
   gbrain dream --phase patterns --once   # run once, ignore dream.patterns.enabled=false
   gbrain dream --phase synthesize --input ~/transcripts/2026-04-25.txt
@@ -852,6 +887,15 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     console.log(JSON.stringify(report, null, 2));
   } else {
     printHuman(report);
+  }
+
+  if (opts.jsonOut) {
+    try {
+      writeCycleReportJsonAtomic(opts.jsonOut, report);
+    } catch (err) {
+      console.error(`failed to write --json-out ${opts.jsonOut}: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
   }
 
   // Exit non-zero when the cycle failed overall (helps cron spot real problems).

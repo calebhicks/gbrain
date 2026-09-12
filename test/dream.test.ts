@@ -26,9 +26,10 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, readdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { execSync } from 'child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { makeGitFixture, type GitFixture } from './helpers/git-fixture.ts';
@@ -324,6 +325,80 @@ describe('runDream — output format', () => {
     expect(parsed).toHaveProperty('status');
     expect(parsed).toHaveProperty('phases');
     expect(parsed).toHaveProperty('totals');
+  });
+
+  test('--json-out writes clean CycleReport JSON while stdout can carry cycle output', async () => {
+    const jsonRepo = mkdtempSync(join(tmpdir(), 'gbrain-dream-json-repo-'));
+    const outDir = mkdtempSync(join(tmpdir(), 'gbrain-dream-json-out-'));
+    const logSpy = spyOn(console, 'log');
+    try {
+      await makeGitFixture(jsonRepo);
+      mkdirSync(join(jsonRepo, 'concepts'), { recursive: true });
+      writeFileSync(join(jsonRepo, 'concepts', 'testing.md'), [
+        '---',
+        'type: concept',
+        'title: Testing',
+        '---',
+        '',
+        'Testing keeps productive cycle output honest.',
+        '',
+      ].join('\n'));
+      execSync('git add -A && git commit -m content', { cwd: jsonRepo, stdio: 'pipe' });
+
+      const outPath = join(outDir, 'reports', 'cycle.json');
+      const lines: string[] = [];
+      logSpy.mockImplementation((msg: string) => { lines.push(String(msg)); });
+      await runDream(engine, ['--dir', jsonRepo, '--phase', 'sync', '--json-out', outPath]);
+
+      const stdout = lines.join('\n');
+      expect(stdout).toContain('Dream cycle');
+      expect(stdout).not.toEqual('');
+      const parsed = JSON.parse(readFileSync(outPath, 'utf8'));
+      expect(parsed.schema_version).toBe('1');
+      expect(parsed.phases[0].phase).toBe('sync');
+      expect(parsed.totals.pages_synced).toBeGreaterThan(0);
+    } finally {
+      logSpy.mockRestore();
+      rmSync(outDir, { recursive: true, force: true });
+      rmSync(jsonRepo, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('--json remains backward-compatible when --json-out is also requested', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'gbrain-dream-json-out-'));
+    const outPath = join(outDir, 'cycle.json');
+    const lines: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((msg: string) => { lines.push(String(msg)); });
+    await runDream(engine, ['--dir', repo, '--phase', 'lint', '--json', '--json-out', outPath]);
+    logSpy.mockRestore();
+
+    const stdoutReport = JSON.parse(lines.join('\n'));
+    const fileReport = JSON.parse(readFileSync(outPath, 'utf8'));
+    expect(stdoutReport.schema_version).toBe('1');
+    expect(fileReport.schema_version).toBe('1');
+    expect(fileReport.phases[0].phase).toBe(stdoutReport.phases[0].phase);
+    rmSync(outDir, { recursive: true, force: true });
+  });
+
+  test('--json-out destination errors fail loudly without leaving a temp success artifact', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'gbrain-dream-json-out-'));
+    const badDest = join(outDir, 'cycle.json');
+    mkdirSync(badDest);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runDream(engine, ['--dir', repo, '--phase', 'lint', '--json-out', badDest]);
+      throw new Error('expected runDream to exit');
+    } catch (e: any) {
+      expect(e.message).toBe('EXIT');
+    }
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errSpy.mock.calls.flat().join(' ')).toMatch(/failed to write --json-out/);
+    expect(statSync(badDest).isDirectory()).toBe(true);
+    expect(readdirSync(outDir).filter(name => name.includes('.tmp'))).toEqual([]);
+    exitSpy.mockRestore();
+    errSpy.mockRestore();
+    rmSync(outDir, { recursive: true, force: true });
   });
 
   // #394 / takeover of #854: the embed phase's `[dry-run] Would embed ...`
