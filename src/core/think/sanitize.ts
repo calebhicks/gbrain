@@ -85,8 +85,14 @@ export interface TakeForPrompt {
   kind: string;
   holder: string;
   weight: number;
+  source_id?: string | null;
   source?: string | null;
   since_date?: string | null;
+  until_date?: string | null;
+}
+
+function attrValue(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').slice(0, 120);
 }
 
 export function renderTakesBlock(takes: TakeForPrompt[]): { rendered: string; sanitizedCount: number } {
@@ -95,9 +101,16 @@ export function renderTakesBlock(takes: TakeForPrompt[]): { rendered: string; sa
   for (const t of takes) {
     const { text, matched } = sanitizeTakeForPrompt(t.claim);
     if (matched.length > 0) sanitizedCount++;
-    const meta = [`kind=${t.kind}`, `who=${t.holder}`, `weight=${t.weight.toFixed(2)}`];
+    const meta = [
+      `kind=${t.kind}`,
+      `who=${t.holder}`,
+      `weight=${t.weight.toFixed(2)}`,
+      `origin_page="${attrValue(t.page_slug)}"`,
+    ];
+    if (t.source_id) meta.push(`origin_source="${attrValue(String(t.source_id))}"`);
     if (t.since_date) meta.push(`since=${t.since_date}`);
-    if (t.source) meta.push(`source="${String(t.source).replace(/"/g, '\\"').slice(0, 80)}"`);
+    if (t.until_date) meta.push(`until=${t.until_date}`);
+    if (t.source) meta.push(`source="${attrValue(String(t.source))}"`);
     lines.push(
       `<take id="${t.page_slug}#${t.row_num}" ${meta.join(' ')}>\n${text}\n</take>`,
     );

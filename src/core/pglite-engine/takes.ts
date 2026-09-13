@@ -315,8 +315,9 @@ export async function searchTakes(
   ): Promise<TakeHit[]> {
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const { rows } = await deps.db.query(
-      `SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, t.row_num,
-              t.claim, t.kind, t.holder, t.weight,
+      `SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, p.source_id,
+              t.row_num, t.claim, t.kind, t.holder, t.weight,
+              t.since_date, t.until_date, t.source,
               word_similarity($1, t.claim)::real AS score
        FROM takes t
        JOIN pages p ON p.id = t.page_id
@@ -349,8 +350,9 @@ export async function searchTakesVector(
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const vec = `[${Array.from(embedding).join(',')}]`;
     const { rows } = await deps.db.query(
-      `SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, t.row_num,
-              t.claim, t.kind, t.holder, t.weight,
+      `SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, p.source_id,
+              t.row_num, t.claim, t.kind, t.holder, t.weight,
+              t.since_date, t.until_date, t.source,
               (1 - (t.embedding <=> $1::vector))::real AS score
        FROM takes t
        JOIN pages p ON p.id = t.page_id
