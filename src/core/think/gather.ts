@@ -253,22 +253,39 @@ export async function runGather(
     // something that isn't there.
     warnings.push('ANCHOR_PAGE_NOT_FOUND');
   }
-  if (anchorPage && !pages.some(p => p.slug === anchorPage.slug)) {
-    pages.unshift({
-      slug: anchorPage.slug,
-      page_id: anchorPage.id,
-      source_id: anchorPage.source_id ?? 'default',
-      title: anchorPage.title,
-      type: anchorPage.type,
-      chunk_text: visibleBody(anchorPage.compiled_truth),
-      chunk_source: 'compiled_truth',
-      chunk_id: 0,
-      chunk_index: 0,
-      // Synthetic rank-0 row: the caller explicitly anchored on this page,
-      // so it pins the top slot ahead of the fused hybrid scores.
-      score: pages.length > 0 ? pages[0].score : 1,
-      stale: false,
-    });
+  if (anchorPage) {
+    const anchorSourceId = anchorPage.source_id ?? 'default';
+    const anchorIdx = pages.findIndex(
+      p => p.slug === anchorPage.slug && (p.source_id ?? 'default') === anchorSourceId,
+    );
+    if (anchorIdx >= 0) {
+      pages[anchorIdx] = {
+        ...pages[anchorIdx],
+        page_id: anchorPage.id,
+        title: anchorPage.title,
+        type: anchorPage.type,
+        chunk_text: visibleBody(anchorPage.compiled_truth),
+        chunk_source: 'compiled_truth',
+        hydrated_anchor: true,
+      };
+    } else {
+      pages.unshift({
+        slug: anchorPage.slug,
+        page_id: anchorPage.id,
+        source_id: anchorPage.source_id ?? 'default',
+        title: anchorPage.title,
+        type: anchorPage.type,
+        chunk_text: visibleBody(anchorPage.compiled_truth),
+        chunk_source: 'compiled_truth',
+        chunk_id: 0,
+        chunk_index: 0,
+        // Synthetic rank-0 row: the caller explicitly anchored on this page,
+        // so it pins the top slot ahead of the fused hybrid scores.
+        score: pages.length > 0 ? pages[0].score : 1,
+        stale: false,
+        hydrated_anchor: true,
+      });
+    }
   }
 
   // Fuse takes streams (keyword + vector). Key by (page_slug, row_num).
@@ -571,11 +588,15 @@ export function selectRelevantExcerptDetailed(
 }
 
 /**
- * #4510 — pages-block char budget. The per-page excerpt length is
+ * #4510 — pages-block base char budget. The per-page excerpt length is
  * budget-aware: `min(ceiling, totalBudget / pageCount)` with the caller's
  * `floor` as the guaranteed minimum, so a big gather never collapses each
  * page below the floor, and a small gather delivers each page in a much
  * larger (often complete) window instead of wasting the budget.
+ *
+ * Hydrated anchor rows may spend the same ceiling even when the high-fanout
+ * base window is smaller; that is a bounded anchor-context expansion, not a
+ * claim that the whole rendered block is globally capped at this budget.
  */
 const PAGES_BLOCK_TOTAL_BUDGET_CHARS = 12_000;
 const PAGES_BLOCK_EXCERPT_CEILING_CHARS = 2_400;
@@ -614,15 +635,19 @@ export function renderPagesBlock(
       compiled_truth?: string;
       chunk_text?: string;
       snippet?: string;
+      hydrated_anchor?: boolean;
     };
     const slug = String(page.slug ?? '');
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
     const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const pageExcerptLen = page.hydrated_anchor
+      ? Math.max(excerptLen, PAGES_BLOCK_EXCERPT_CEILING_CHARS)
+      : excerptLen;
     const excerpt = selectRelevantExcerptDetailed(
       content,
       query,
-      excerptLen,
+      pageExcerptLen,
       `${title} ${slugIdentity}`,
     );
     const body =
