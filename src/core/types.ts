@@ -866,6 +866,13 @@ export interface SearchResult {
    */
   effective_date?: string | null;
   effective_date_source?: string | null;
+  /**
+   * Think-gather internal hint: this row's prompt body was hydrated from the
+   * canonical anchor page after hybrid ranking. Renderers may spend the
+   * existing per-page ceiling on this one row so immediate local correction
+   * context is not lost to the high-fanout 600-char floor.
+   */
+  hydrated_anchor?: boolean;
   /** RFC 5322 Message-ID projected from allowlisted email frontmatter. */
   message_id?: string;
   /** Gmail thread id projected from allowlisted email frontmatter. */

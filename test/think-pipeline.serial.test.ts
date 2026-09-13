@@ -6,7 +6,7 @@ import { runThink, persistSynthesis, type ThinkLLMClient } from '../src/core/thi
 import { sanitizeTakeForPrompt, renderTakesBlock } from '../src/core/think/sanitize.ts';
 import { resolveCitations, parseInlineCitations, normalizeStructuredCitations } from '../src/core/think/cite-render.ts';
 import { THINK_SYSTEM_PROMPT_BASE } from '../src/core/think/prompt.ts';
-import { runGather, renderPagesBlock, takesHitToTakeForPrompt } from '../src/core/think/gather.ts';
+import { runGather, renderPagesBlock, pagesBlockExcerptLen, takesHitToTakeForPrompt } from '../src/core/think/gather.ts';
 import { withoutAnthropicKey } from './helpers/no-anthropic-key.ts';
 
 let engine: PGLiteEngine;
@@ -250,6 +250,83 @@ describe('runGather — anchor page hydration (#2903)', () => {
     });
     const hits = r.pages.filter(p => p.slug === 'people/alice-example');
     expect(hits.length).toBe(1);
+  });
+
+  test('reuses hydrated canonical anchor body over an existing shorter hybrid row', async () => {
+    const prefix = 'Delta renewal background. '.repeat(21);
+    const wrong = 'Suggested date: January 10, 2026 for Delta renewal. ';
+    const bridge = 'x'.repeat(Math.max(0, 610 - prefix.length - wrong.length));
+    const correction = 'Correction: the actual Delta renewal date is February 20, 2026.';
+    const canonical = `${prefix}${wrong}${bridge}${correction}${' Long tail.'.repeat(400)}`;
+    const anchorSlug = 'contracts/delta-renewal-anchor';
+    const insertedIds: number[] = [];
+    let getPageCalls = 0;
+    try {
+      const anchor = await engine.putPage(anchorSlug, {
+        title: 'Delta Renewal Anchor',
+        type: 'note',
+        compiled_truth: canonical,
+      });
+      insertedIds.push(anchor.id);
+      await engine.upsertChunks(anchorSlug, [{
+        chunk_index: 0,
+        chunk_text: `${prefix}${wrong}`,
+        chunk_source: 'compiled_truth',
+      }]);
+      for (let i = 0; i < 20; i++) {
+        const page = await engine.putPage(`contracts/delta-renewal-neighbor-${i}`, {
+          title: `Delta Renewal Neighbor ${i}`,
+          type: 'note',
+          compiled_truth: `Delta renewal date neighbor ${i}. ${'filler '.repeat(80)}`,
+        });
+        insertedIds.push(page.id);
+        await engine.upsertChunks(page.slug, [{
+          chunk_index: 0,
+          chunk_text: `Delta renewal date neighbor ${i}. ${'filler '.repeat(80)}`,
+          chunk_source: 'compiled_truth',
+        }]);
+      }
+
+      const counted = new Proxy(engine, {
+        get(target, prop) {
+          if (prop === 'getPage') {
+            return async (...args: Parameters<PGLiteEngine['getPage']>) => {
+              getPageCalls += 1;
+              return target.getPage(...args);
+            };
+          }
+          const v = Reflect.get(target, prop, target);
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      }) as PGLiteEngine;
+      const r = await runGather(counted, {
+        question: 'What is the Delta renewal date?',
+        anchor: anchorSlug,
+        remote: false,
+        gatherLimit: 25,
+      });
+
+      expect(getPageCalls).toBe(1);
+      expect(r.diagnostics.pagesFromHybrid).toBeGreaterThanOrEqual(21);
+      const anchorHits = r.pages.filter(p => p.slug === anchorSlug && (p.source_id ?? 'default') === 'default');
+      expect(anchorHits.length).toBe(1);
+      const anchorHit = anchorHits[0];
+      expect(anchorHit.chunk_source).toBe('compiled_truth');
+      expect(anchorHit.chunk_id).toBeGreaterThan(0);
+      expect(anchorHit.hydrated_anchor).toBe(true);
+      expect(anchorHit.chunk_text).toContain('Suggested date: January 10, 2026');
+      expect(anchorHit.chunk_text).toContain('Correction: the actual Delta renewal date is February 20, 2026');
+
+      const block = renderPagesBlock(r.pages, pagesBlockExcerptLen(r.pages.length), 'What is the Delta renewal date?');
+      expect(r.pages.length).toBeGreaterThanOrEqual(21);
+      expect(pagesBlockExcerptLen(r.pages.length)).toBe(600);
+      expect(block).toContain('Suggested date: January 10, 2026');
+      expect(block).toContain('Correction: the actual Delta renewal date is February 20, 2026');
+    } finally {
+      for (const id of insertedIds) {
+        await engine.executeRaw('DELETE FROM pages WHERE id = $1', [id]);
+      }
+    }
   });
 
   test('missing anchor page → ANCHOR_PAGE_NOT_FOUND warning, no synthetic row', async () => {

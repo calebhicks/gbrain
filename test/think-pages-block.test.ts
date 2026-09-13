@@ -266,4 +266,48 @@ describe('renderPagesBlock — #4510 truncation honesty', () => {
     expect(pagesBlockExcerptLen(1)).toBe(2400);   // ceiling
     expect(pagesBlockExcerptLen(0)).toBe(600);
   });
+
+  test('hydrated anchor gets bounded continuation context in a 20+ page block', () => {
+    const prefix = 'Delta renewal background. '.repeat(21);
+    const wrong = 'Suggested date: January 10, 2026 for Delta renewal. ';
+    const bridge = 'x'.repeat(Math.max(0, 1100 - prefix.length - wrong.length));
+    const correction = 'Correction: the actual Delta renewal date is February 20, 2026.';
+    const content = `${prefix}${wrong}${bridge}${correction}${' Long tail.'.repeat(400)}`;
+    expect(content.indexOf(wrong)).toBeLessThan(600);
+    expect(content.indexOf(correction)).toBeGreaterThan(600);
+    expect(content.indexOf(correction)).toBeLessThan(2400);
+
+    const ordinaryPages = [
+      searchResult(content, 'Delta Contract', 'contracts/delta-renewal'),
+      ...Array.from({ length: 20 }, (_, i) => searchResult(
+        `Unrelated page ${i}. ${'filler '.repeat(200)}`,
+        `Other ${i}`,
+        `notes/other-${i}`,
+      )),
+    ];
+    const ordinary = renderPagesBlock(
+      ordinaryPages,
+      pagesBlockExcerptLen(ordinaryPages.length),
+      'What is the Delta renewal date?',
+    );
+    expect(pagesBlockExcerptLen(ordinaryPages.length)).toBe(600);
+    expect(ordinary).toContain('Suggested date: January 10, 2026');
+    expect(ordinary).not.toContain('February 20, 2026');
+
+    const anchorPages = [
+      { ...ordinaryPages[0], hydrated_anchor: true },
+      ...ordinaryPages.slice(1),
+    ];
+    const rendered = renderPagesBlock(
+      anchorPages,
+      pagesBlockExcerptLen(anchorPages.length),
+      'What is the Delta renewal date?',
+    );
+    const anchorExcerpt = renderedExcerpt(rendered);
+    const anchorBody = excerptBody(rendered);
+    expect(anchorExcerpt).toContain('Suggested date: January 10, 2026');
+    expect(anchorExcerpt).toContain('Correction: the actual Delta renewal date is February 20, 2026');
+    expect(anchorExcerpt).toContain(EXCERPT_CUT_END_MARKER);
+    expect(anchorBody.length).toBeLessThanOrEqual(2400);
+  });
 });
