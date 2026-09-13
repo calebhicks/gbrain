@@ -143,6 +143,46 @@ This is the compiled truth.
     expect(chunkCall).toBeTruthy();
   });
 
+  test('does not invent an effective date for generated synthesis imports', async () => {
+    const filePath = join(TMP, '2026-09-13-example.md');
+    writeFileSync(filePath, `---
+type: synthesis
+generated_at: 2026-09-13T10:00:00Z
+---
+
+Generated synthesis without a source event date.
+`);
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'synthesis/2026-09-13-example.md', { noEmbed: true });
+
+    expect(result.status).toBe('imported');
+    const putCall = (engine as any)._calls.find((c: any) => c.method === 'putPage');
+    expect(putCall.args[1].effective_date).toBeNull();
+    expect(putCall.args[1].effective_date_source).toBeNull();
+    expect(putCall.args[1].import_filename).toBe('2026-09-13-example');
+  });
+
+  test('preserves explicit event_date for generated synthesis imports', async () => {
+    const filePath = join(TMP, '2026-09-13-eventful.md');
+    writeFileSync(filePath, `---
+type: synthesis
+generated_at: 2026-09-13T10:00:00Z
+event_date: 2026-08-20
+---
+
+Generated synthesis with explicit source event date.
+`);
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'synthesis/2026-09-13-eventful.md', { noEmbed: true });
+
+    expect(result.status).toBe('imported');
+    const putCall = (engine as any)._calls.find((c: any) => c.method === 'putPage');
+    expect(putCall.args[1].effective_date?.toISOString().startsWith('2026-08-20')).toBe(true);
+    expect(putCall.args[1].effective_date_source).toBe('event_date');
+  });
+
   test('strips a UTF-8 BOM so the heading title is used (#4798)', async () => {
     // Written as bytes so no editor can silently strip the BOM from a fixture.
     const filePath = join(TMP, 'bom-note.md');

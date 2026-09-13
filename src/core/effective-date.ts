@@ -112,6 +112,11 @@ function hasFilenameFirstPrefix(slug: string): boolean {
   return false;
 }
 
+function isGeneratedSynthesis(slug: string, frontmatter: Record<string, unknown>): boolean {
+  if (frontmatter.generated_at == null) return false;
+  return frontmatter.type === 'synthesis' || slug.startsWith('synthesis/');
+}
+
 /**
  * Run the precedence chain. Returns the first valid (in-range) date and its
  * source label. Falls all the way through to updated_at / created_at as
@@ -125,6 +130,10 @@ export function computeEffectiveDate(opts: ComputeEffectiveDateOpts): EffectiveD
   const fmDate = validateInRange(parseDateLoose(frontmatter.date));
   const fmPublished = validateInRange(parseDateLoose(frontmatter.published));
   const filenameDate = extractFilenameDate(filename);
+
+  if (isGeneratedSynthesis(slug, frontmatter)) {
+    return fmEvent !== null ? { date: fmEvent, source: 'event_date' } : { date: null, source: null };
+  }
 
   // Build the ordered candidate list. For filename-first prefixes
   // (daily/, meetings/) the filename moves to the head of the chain.

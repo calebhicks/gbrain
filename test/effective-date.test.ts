@@ -84,6 +84,31 @@ describe('computeEffectiveDate precedence chain (default order)', () => {
     expect(r.source).toBe('fallback');
     expect(r.date?.toISOString()).toBe(baseUpdated.toISOString());
   });
+
+  test('generated synthesis marker suppresses filename and fallback dates', () => {
+    const r = run({
+      slug: 'synthesis/2026-09-13-example',
+      fm: { type: 'synthesis', generated_at: '2026-09-13T10:00:00Z' },
+      filename: '2026-09-13-example',
+      updatedAt: new Date('2026-09-13T10:00:00Z'),
+      createdAt: new Date('2026-09-13T10:00:00Z'),
+    });
+    expect(r).toEqual({ date: null, source: null });
+  });
+
+  test('generated synthesis keeps explicit event_date semantics', () => {
+    const r = run({
+      slug: 'synthesis/2026-09-13-example',
+      fm: {
+        type: 'synthesis',
+        generated_at: '2026-09-13T10:00:00Z',
+        event_date: '2026-08-20',
+      },
+      filename: '2026-09-13-example',
+    });
+    expect(r.source).toBe('event_date');
+    expect(r.date?.toISOString().startsWith('2026-08-20')).toBe(true);
+  });
 });
 
 describe('computeEffectiveDate per-prefix override (daily/, meetings/)', () => {
