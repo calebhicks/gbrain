@@ -11,16 +11,18 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { emptyHome, withEnv } from './helpers/with-env.ts';
 import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 import {
   ALL_PHASES,
   SOURCE_PHASES,
   SOURCE_FRESHNESS_PHASES,
+  SCHEDULED_SOURCE_PHASES,
   SOURCE_BACKGROUND_PHASES,
   MIXED_PHASES,
   GLOBAL_PHASES,
@@ -54,22 +56,27 @@ describe('cycle phase partition (#2194 fix #3)', () => {
     expect(GLOBAL_PHASES).toContain('purge');
     expect(SOURCE_PHASES).toContain('lint');
     expect(SOURCE_PHASES).toContain('sync');
+    expect(SOURCE_PHASES).toContain('synthesize_concepts');
     expect(SOURCE_PHASES).not.toContain('embed');
     expect(MIXED_PHASES).toEqual(['synthesize', 'patterns']);
     expect(MAINTENANCE_PHASES).toContain('synthesize');
     expect(MAINTENANCE_PHASES).toContain('patterns');
     expect(MAINTENANCE_PHASES).toContain('embed');
+    expect(MAINTENANCE_PHASES).not.toContain('synthesize_concepts');
   });
 
-  test('source freshness excludes LLM-backed/background source work', () => {
+  test('source freshness excludes LLM-backed/background source work except scheduled concept synthesis', () => {
     expect(new Set([...SOURCE_FRESHNESS_PHASES, ...SOURCE_BACKGROUND_PHASES])).toEqual(new Set(SOURCE_PHASES));
     expect(SOURCE_FRESHNESS_PHASES).toContain('sync');
     expect(SOURCE_FRESHNESS_PHASES).toContain('extract_facts');
+    expect(SCHEDULED_SOURCE_PHASES).toEqual([...SOURCE_FRESHNESS_PHASES, 'synthesize_concepts']);
     expect(SOURCE_BACKGROUND_PHASES).toContain('extract_atoms');
+    expect(SOURCE_BACKGROUND_PHASES).toContain('synthesize_concepts');
     expect(SOURCE_BACKGROUND_PHASES).toContain('consolidate');
     expect(SOURCE_BACKGROUND_PHASES).toContain('propose_takes');
     expect(SOURCE_BACKGROUND_PHASES).toContain('enrich_thin');
     expect(SOURCE_FRESHNESS_PHASES).not.toContain('extract_atoms');
+    expect(SOURCE_FRESHNESS_PHASES).not.toContain('synthesize_concepts');
   });
 
   test('implicit source cycles are freshness-only; explicit phase lists are honored verbatim', () => {
@@ -180,6 +187,7 @@ describe('dispatchGlobalMaintenance — single-flight gate', () => {
     expect(added[0].opts.maxPending).toBe(1);
     expect(added[0].opts.maxWaiting).toBeUndefined();
     expect(added[0].data.phases).toEqual(MAINTENANCE_PHASES);
+    expect(added[0].data.phases).not.toContain('synthesize_concepts');
   });
 
   test('fresh → does NOT dispatch', async () => {
@@ -211,8 +219,8 @@ describe('dispatchGlobalMaintenance — single-flight gate', () => {
   });
 });
 
-describe('dispatchPerSource — per-source jobs carry SOURCE phases only', () => {
-  test('each per-source job excludes mixed and global phases', async () => {
+describe('dispatchPerSource — per-source jobs carry scheduled source phases only', () => {
+  test('each per-source job includes concept synthesis but excludes mixed and global phases', async () => {
     const sources = [{ id: 'repo-a', name: 'a', config: {} }, { id: 'repo-b', name: 'b', config: {} }];
     const added: any[] = [];
     const engine = {
@@ -225,10 +233,12 @@ describe('dispatchPerSource — per-source jobs carry SOURCE phases only', () =>
     await dispatchPerSource(engine, queue, { repoPath: '/tmp', slot: 's', timeoutMs: 1, fanoutMax: 4, jsonMode: true, emit: () => {}, log: () => {} });
     expect(added.length).toBe(2);
     for (const j of added) {
-      expect(j.data.phases).toEqual(SOURCE_FRESHNESS_PHASES);
+      expect(j.data.phases).toEqual(SCHEDULED_SOURCE_PHASES);
+      expect(j.data.phases).toContain('synthesize_concepts');
       expect(j.data.phases).not.toContain('synthesize');
       expect(j.data.phases).not.toContain('patterns');
       expect(j.data.phases).not.toContain('embed');
+      expect(j.data.phases).not.toContain('extract_atoms');
     }
   });
 });
@@ -246,11 +256,11 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     return handlers;
   }
 
-  test('autopilot-cycle handler normalizes a legacy per-source payload down to freshness phases', async () => {
+  test('autopilot-cycle handler normalizes a legacy per-source payload down to scheduled source phases', async () => {
     // Pre-v0.46.20 fanout payloads carried NON_GLOBAL_PHASES (mixed +
     // background). A legacy job draining after upgrade must not re-run that
-    // work once per source: the handler intersects the queued list with
-    // SOURCE_FRESHNESS_PHASES and surfaces what it rejected.
+    // work once per source: the handler intersects the queued list with the
+    // scheduled-source phase set and surfaces what it rejected.
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, NULL)`,
       ['repo-a', 'repo-a'],
@@ -266,9 +276,58 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     });
     expect(result.phases_rejected_by_normalization)
       .toEqual(['synthesize', 'patterns', 'extract_atoms', 'consolidate']);
-    // Only the freshness subset reached runCycle.
+    // Only the scheduled subset present in the payload reached runCycle.
     expect(result.report.phases.map((p: any) => p.phase)).toEqual(['sync', 'extract']);
   });
+
+  test('autopilot-cycle admits synthesize_concepts for a non-default eligible source', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, NULL)`,
+      ['repo-concepts', 'repo-concepts'],
+    );
+    for (const slug of ['atoms/scheduled-a', 'atoms/scheduled-b']) {
+      await engine.putPage(slug, {
+        type: 'atom',
+        title: slug,
+        compiled_truth: `body for ${slug}`,
+        timeline: '',
+        frontmatter: { concepts: ['scheduled-theme'] },
+      }, { sourceId: 'repo-concepts' });
+    }
+
+    const home = emptyHome();
+    mkdirSync(join(home, '.gbrain'), { recursive: true });
+    writeFileSync(join(home, '.gbrain', 'config.json'), JSON.stringify({
+      engine: 'pglite',
+      schema_pack: 'gbrain-creator',
+    }));
+
+    await withEnv({
+      GBRAIN_HOME: home,
+      ANTHROPIC_API_KEY: undefined,
+      OPENAI_API_KEY: undefined,
+    }, async () => {
+      const handlers = await captureHandlers();
+      const handler = handlers.get('autopilot-cycle');
+      expect(handler).toBeTruthy();
+
+      const result = await handler!({
+        data: { source_id: 'repo-concepts', phases: ['synthesize_concepts'], pull: false },
+        signal: undefined,
+      });
+
+      expect(result.phases_rejected_by_normalization).toBeUndefined();
+      const synth = result.report.phases.find((p: any) => p.phase === 'synthesize_concepts');
+      expect(synth?.status).toBe('ok');
+      expect(synth?.details?.concepts_written).toBe(1);
+      expect(await engine.getPage('concepts/scheduled-theme', { sourceId: 'repo-concepts' })).not.toBeNull();
+      expect(await engine.getPage('concepts/scheduled-theme', { sourceId: 'default' })).toBeNull();
+      const rollups = await engine.executeRaw<{ source_id: string }>(
+        `SELECT source_id FROM extract_rollup_7d WHERE kind = 'concepts'`,
+      );
+      expect(rollups.map((r) => r.source_id)).toEqual(['repo-concepts']);
+    });
+  }, 120_000);
 
   test('an all-rejected queued payload is an explicit no-op, not an implicit freshness run', async () => {
     await engine.executeRaw(
@@ -331,6 +390,7 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     for (const p of MAINTENANCE_PHASES) expect(ranPhases).toContain(p);
     expect(ranPhases).toContain('synthesize');
     expect(ranPhases).toContain('patterns');
+    expect(ranPhases).not.toContain('synthesize_concepts');
     expect(ranPhases).not.toContain('sync');
     expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).not.toBeNull();
   }, 60_000);
