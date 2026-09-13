@@ -32,7 +32,7 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   purge: 'global',
   'schema-suggest': 'source',
   extract_atoms: 'source',
-  synthesize_concepts: 'global',
+  synthesize_concepts: 'source',
   conversation_facts_backfill: 'source',
   enrich_thin: 'source',
   skillopt: 'global',

@@ -3,7 +3,7 @@
 // IRON-RULE regression pinning:
 //   1. ALL_PHASES includes 'extract_atoms' (after extract_facts) and
 //      'synthesize_concepts' (after patterns).
-//   2. PHASE_SCOPE declares extract_atoms='source', synthesize_concepts='global'.
+//   2. PHASE_SCOPE declares extract_atoms='source', synthesize_concepts='source'.
 //   3. NEEDS_LOCK_PHASES includes both (they mutate DB via put_page).
 //   4. cycle.ts dispatch contains the packDeclaresPhase gate for both
 //      new phases (source-shape assertion — pins the not_in_active_pack
@@ -62,8 +62,8 @@ describe('v0.41 T9 R-GATE: ALL_PHASES + PHASE_SCOPE contract', () => {
     expect(PHASE_SCOPE.extract_atoms).toBe('source');
   });
 
-  test('PHASE_SCOPE declares synthesize_concepts as global-scoped', () => {
-    expect(PHASE_SCOPE.synthesize_concepts).toBe('global');
+  test('PHASE_SCOPE declares synthesize_concepts as source-scoped', () => {
+    expect(PHASE_SCOPE.synthesize_concepts).toBe('source');
   });
 
   test('every ALL_PHASES entry has a PHASE_SCOPE entry (exhaustive map)', () => {

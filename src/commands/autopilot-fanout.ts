@@ -35,7 +35,7 @@
 import { existsSync } from 'fs';
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
-import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
+import { SCHEDULED_SOURCE_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
 import { sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
@@ -512,10 +512,10 @@ export async function dispatchPerSource(
           repoPath: opts.repoPath,
           source_id: src.id,
           pull: shouldPull,
-          // Freshness is stamped by bounded deterministic work only. LLM-backed
-          // source enrichment (atoms, takes, thin-page development, etc.) is
-          // explicit/background work and cannot hold source freshness hostage.
-          phases: SOURCE_FRESHNESS_PHASES,
+          // Scheduled source rotation runs bounded freshness work plus the
+          // source-local concept synthesis pass. Other LLM-backed source
+          // background work remains explicit/background-only.
+          phases: SCHEDULED_SOURCE_PHASES,
         },
         {
           queue: 'default',

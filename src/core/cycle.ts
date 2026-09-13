@@ -82,9 +82,10 @@ export type CyclePhase =
   //    transcripts/articles/meetings into atom-typed pages. Gated on the
   //    active pack's `phases:` declaration (gbrain-creator or gbrain-
   //    everything declare this); other packs are no-op.
-  //  - synthesize_concepts: global aggregation of atoms into tier-promoted
-  //    concept pages via dedup → tier → Sonnet T1/T2 voice-gated narratives.
-  //    Same pack-gate model.
+  //  - synthesize_concepts: source-local aggregation of atoms into tier-
+  //    promoted concept pages via dedup → tier → Sonnet T1/T2 voice-gated
+  //    narratives. Same pack-gate model. Cross-source concept synthesis is a
+  //    separate future phase, not a brain-global scan here.
   | 'extract_atoms' | 'synthesize_concepts'
   // v0.41.11.0 — opt-in (default OFF) bulk fact extraction for long-form
   // conversation pages. The outer scheduler uses PHASE_SCOPE, while this
@@ -131,9 +132,9 @@ export const ALL_PHASES: CyclePhase[] = [
   // BATCH_SIZE*10 chunks where edges_backfilled_at IS NULL or stale.
   'resolve_symbol_edges',
   'patterns',
-  // v0.41 T9 — concept synthesis (global, pack-gated). Runs AFTER patterns
-  // so the cluster pass sees fresh cross-session themes. Same pack-gate
-  // model as extract_atoms.
+  // v0.41 T9 — concept synthesis (source-local, pack-gated). Runs AFTER
+  // patterns so the cluster pass sees fresh cross-session themes from this
+  // source. Cross-source concept synthesis is a separate concern.
   'synthesize_concepts',
   // v0.29 — runs AFTER extract + synthesize so it sees the union of
   // sync-touched + synthesize-written pages with fresh tag + take state.
@@ -199,17 +200,20 @@ export const ALL_PHASES: CyclePhase[] = [
 /**
  * #2194 fix #3 / #2227 bug #3 — the cycle split.
  *
- * Per-source autopilot cycles enqueue ONLY the deterministic freshness subset
- * (SOURCE_FRESHNESS_PHASES); the autopilot-cycle handler normalizes queued
+ * Per-source autopilot cycles enqueue the scheduled source subset
+ * (SCHEDULED_SOURCE_PHASES); the autopilot-cycle handler normalizes queued
  * per-source payloads down to that subset so legacy payloads can't re-run
  * heavier work N-way. Mixed phases read brain-wide inputs and therefore
  * cannot safely fan out by source: synthesize reads the global transcript
  * corpus, and patterns reads cross-source reflections. They join the
  * brain-wide phases in the single maintenance job instead of being repeated
- * into every source. SOURCE_BACKGROUND_PHASES have no automatic lane on
+ * into every source. Most SOURCE_BACKGROUND_PHASES have no automatic lane on
  * multi-source brains yet — they run on explicit invocation
  * (`gbrain dream --source X --phase extract_atoms`) until the background
- * lane lands (see TODOS).
+ * lane lands (see TODOS). `synthesize_concepts` is the narrow exception:
+ * its implementation is already source-local, bounded, and source-qualified,
+ * so scheduled source rotation includes it without admitting every
+ * source-background phase.
  *
  * SOURCE_PHASES ∪ MIXED_PHASES ∪ GLOBAL_PHASES == ALL_PHASES, with no overlap.
  * MAINTENANCE_PHASES is MIXED ∪ GLOBAL in original cycle order.
@@ -223,6 +227,12 @@ export const MAINTENANCE_PHASES: CyclePhase[] = ALL_PHASES.filter((p) => PHASE_S
 export const SOURCE_BACKGROUND_PHASES: CyclePhase[] = SOURCE_PHASES.filter(
   (phase) => !SOURCE_FRESHNESS_PHASES.includes(phase),
 );
+
+/** Per-source phases admitted to scheduled source-rotation jobs. */
+export const SCHEDULED_SOURCE_PHASES: CyclePhase[] = [
+  ...SOURCE_FRESHNESS_PHASES,
+  'synthesize_concepts',
+];
 
 /**
  * Resolve the effective phase list for one cycle invocation.
@@ -239,7 +249,7 @@ export const SOURCE_BACKGROUND_PHASES: CyclePhase[] = SOURCE_PHASES.filter(
  * source with no phase flag hits the implicit branch above. Machine callers
  * that enqueue per-source phase lists are normalized at the queue boundary
  * instead (the `autopilot-cycle` handler intersects queued per-source
- * payloads with SOURCE_FRESHNESS_PHASES), so a queued legacy payload cannot
+ * payloads with SCHEDULED_SOURCE_PHASES), so a queued legacy payload cannot
  * re-run mixed or background work once per source while human intent stays
  * authoritative.
  *
@@ -265,7 +275,7 @@ export function resolveCyclePhases(
  * not operator intent. Pre-v0.46.20 fanout payloads carried the old
  * NON_GLOBAL set — mixed + background work that must not re-run once per
  * source when a legacy job drains after upgrade. Intersecting with
- * SOURCE_FRESHNESS_PHASES is a fixed point for current fanout payloads and a
+ * SCHEDULED_SOURCE_PHASES is a fixed point for current fanout payloads and a
  * safe downgrade for legacy ones. Operator intent goes through the CLI
  * (`gbrain dream --source X --phase …`), which resolveCyclePhases honors
  * verbatim — this normalization is for the queue handler only.
@@ -280,10 +290,10 @@ export function normalizeQueuedSourcePhases(
   sourceId: string | undefined,
 ): { phases: CyclePhase[] | undefined; rejected: CyclePhase[] } {
   if (!sourceId || requested === undefined) return { phases: requested, rejected: [] };
-  const freshness = new Set<CyclePhase>(SOURCE_FRESHNESS_PHASES);
+  const scheduled = new Set<CyclePhase>(SCHEDULED_SOURCE_PHASES);
   return {
-    phases: requested.filter((p) => freshness.has(p)),
-    rejected: requested.filter((p) => !freshness.has(p)),
+    phases: requested.filter((p) => scheduled.has(p)),
+    rejected: requested.filter((p) => !scheduled.has(p)),
   };
 }
 
@@ -2494,7 +2504,7 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    // ── v0.41 T9: synthesize_concepts (global, pack-gated) ───────
+    // ── v0.41 T9: synthesize_concepts (source-local, pack-gated) ──
     // Same pack-gate model as extract_atoms. Reads `phases:` from the
     // resolved active pack manifest; no-op when this phase isn't
     // declared. Real body in T6 — synthesize-concepts.ts is a stub today.

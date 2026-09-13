@@ -64,4 +64,8 @@ describe('PHASE_SCOPE coverage', () => {
   test('sync remains source-scoped (the headline per-source phase)', () => {
     expect(PHASE_SCOPE.sync).toBe('source');
   });
+
+  test('synthesize_concepts remains source-scoped', () => {
+    expect(PHASE_SCOPE.synthesize_concepts).toBe('source');
+  });
 });
