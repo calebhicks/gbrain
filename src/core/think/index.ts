@@ -1001,7 +1001,7 @@ export async function persistSynthesis(
       type: 'synthesis',
       question: result.question,
       model: result.modelUsed,
-      date: today,
+      generated_at: new Date().toISOString(),
       pages_gathered: result.pagesGathered,
       takes_gathered: result.takesGathered,
     },
