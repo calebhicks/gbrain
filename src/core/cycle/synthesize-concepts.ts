@@ -121,6 +121,12 @@ interface AtomGroup {
   tier: 'T1' | 'T2' | 'T3' | 'T4';
 }
 
+interface AtomMember {
+  slug: string;
+  title: string;
+  body: string;
+}
+
 type ConceptInputIdentity =
   | 'current'
   | 'changed'
@@ -209,11 +215,12 @@ export async function runPhaseSynthesizeConcepts(
     if (count < TIER_T3_MIN) continue;
     const tier: AtomGroup['tier'] =
       count >= TIER_T1_MIN ? 'T1' : count >= TIER_T2_MIN ? 'T2' : 'T3';
+    const members = canonicalAtomMembers(data);
     atomGroups.push({
       conceptSlug,
-      atomSlugs: data.slugs,
-      atomTitles: data.titles,
-      atomBodies: data.bodies,
+      atomSlugs: members.map((m) => m.slug),
+      atomTitles: members.map((m) => m.title),
+      atomBodies: members.map((m) => m.body),
       tier,
     });
   }
@@ -244,6 +251,7 @@ export async function runPhaseSynthesizeConcepts(
   let conceptsPreserved = 0;
   let conceptsUnfinished = 0;
   let legacyInputUnknown = 0;
+  let changedInputPreserved = 0;
   let estimatedSpendUsd = 0;
   const budgetCap = DEFAULT_BUDGET_USD;
   const failures: Array<{ concept: string; error: string }> = [];
@@ -322,11 +330,25 @@ export async function runPhaseSynthesizeConcepts(
     if (inputIdentity === 'unknown' && hasUsefulNarrative(existingConcept)) {
       legacyInputUnknown++;
     }
+    const preserveUnknownExisting = hasUsefulNarrative(existingConcept) &&
+      !['budget_fallback', 'error_fallback'].includes(existingConcept.frontmatter?.synthesis_mode as string) && inputIdentity === 'unknown';
+    const preserveChangedTierDrop = hasUsefulNarrative(existingConcept) &&
+      inputIdentity === 'changed' &&
+      (group.tier === 'T3' || group.tier === 'T4') &&
+      existingConcept.frontmatter?.synthesis_mode === 'llm';
+    const preserveExistingNarrative = (unfinished = true) => {
+      conceptsPreserved++;
+      if (unfinished) conceptsUnfinished++;
+      if (inputIdentity === 'changed') changedInputPreserved++;
+    };
+    if (preserveUnknownExisting) {
+      preserveExistingNarrative(false);
+      continue;
+    }
     if (group.tier === 'T1' || group.tier === 'T2') {
       if (estimatedSpendUsd >= budgetCap) {
         if (hasUsefulNarrative(existingConcept)) {
-          conceptsPreserved++;
-          conceptsUnfinished++;
+          preserveExistingNarrative();
           continue;
         }
         narrative = deterministicNarrative(group);
@@ -371,8 +393,7 @@ export async function runPhaseSynthesizeConcepts(
           } else {
             failures.push({ concept: group.conceptSlug, error: 'empty model response' });
             if (hasUsefulNarrative(existingConcept)) {
-              conceptsPreserved++;
-              conceptsUnfinished++;
+              preserveExistingNarrative();
               continue;
             }
             narrative = deterministicNarrative(group);
@@ -402,8 +423,7 @@ export async function runPhaseSynthesizeConcepts(
             continue;
           }
           if (hasUsefulNarrative(existingConcept)) {
-            conceptsPreserved++;
-            conceptsUnfinished++;
+            preserveExistingNarrative();
             continue;
           }
           narrative = deterministicNarrative(group);
@@ -411,6 +431,10 @@ export async function runPhaseSynthesizeConcepts(
         }
       }
     } else {
+      if (preserveChangedTierDrop) {
+        preserveExistingNarrative();
+        continue;
+      }
       narrative = deterministicNarrative(group);
       synthesisMode = 'deterministic_tier';
     }
@@ -496,7 +520,9 @@ export async function runPhaseSynthesizeConcepts(
           `(llm=${synthesisModeCounts.llm} deterministic=${synthesisModeCounts.deterministic_tier} ` +
           `budget_fallback=${synthesisModeCounts.budget_fallback} error_fallback=${synthesisModeCounts.error_fallback}) ` +
           `from ${atomGroups.length} groups across ${atoms.length} atoms` +
-          (legacyInputUnknown > 0 ? `; ${legacyInputUnknown} preserved/read legacy input identity as unknown.` : '.'),
+          (legacyInputUnknown > 0 || changedInputPreserved > 0
+            ? `; preserved/read input identity unknown=${legacyInputUnknown} changed=${changedInputPreserved}.`
+            : '.'),
       });
     } catch (err) {
       console.error(`[synthesize_concepts] receipt write failed: ${(err as Error).message}`);
@@ -531,6 +557,7 @@ export async function runPhaseSynthesizeConcepts(
       concepts_preserved: conceptsPreserved,
       concepts_unfinished: conceptsUnfinished,
       legacy_input_unknown: legacyInputUnknown,
+      changed_input_preserved: changedInputPreserved,
       tier_counts: tierCounts,
       synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
@@ -549,15 +576,26 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalAtomMembers(data: { slugs: string[]; titles: string[]; bodies: string[] }): AtomMember[] {
+  return data.slugs.map((slug, idx) => ({
+    slug,
+    title: data.titles[idx] ?? '',
+    body: data.bodies[idx] ?? '',
+  })).sort(compareAtomMembers);
+}
+
+function compareAtomMembers(a: AtomMember, b: AtomMember): number {
+  return a.slug.localeCompare(b.slug) ||
+    a.title.localeCompare(b.title) ||
+    sha256(a.body).localeCompare(sha256(b.body));
+}
+
 function conceptInputFingerprint(group: AtomGroup, sourceId: string, modelId: string): string {
   const members = group.atomSlugs.map((slug, idx) => ({
     slug,
     title: group.atomTitles[idx] ?? '',
     body_sha256: sha256(group.atomBodies[idx] ?? ''),
-  })).sort((a, b) =>
-    a.slug.localeCompare(b.slug) ||
-    a.title.localeCompare(b.title) ||
-    a.body_sha256.localeCompare(b.body_sha256));
+  }));
   return sha256(JSON.stringify({
     version: CONCEPT_SYNTH_INPUT_VERSION,
     source_id: sourceId,
