@@ -20,6 +20,7 @@
 //      For T3/T4: deterministic stub narrative.
 //   6. Write concept-typed pages with the synthesis mode made explicit.
 
+import { createHash } from 'node:crypto';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { resolveModel } from '../model-config.ts';
 import type { PhaseResult } from '../cycle.ts';
@@ -35,6 +36,7 @@ import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } f
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
+import type { Page } from '../types.ts';
 
 const DEFAULT_BUDGET_USD = 1.5;
 // Canonical-miss policy — mirrors skillopt/preflight.ts's lookupPrice:
@@ -51,6 +53,12 @@ const FALLBACK_PRICING: ModelPricing = canonicalLookup('anthropic:claude-sonnet-
 const TIER_T1_MIN = 10;
 const TIER_T2_MIN = 5;
 const TIER_T3_MIN = 2;
+const CONCEPT_SYNTH_INPUT_VERSION = 1;
+const CONCEPT_SYNTH_INPUT_FINGERPRINT_KEY = 'concept_synthesis_input_fingerprint';
+const CONCEPT_SYNTH_INPUT_VERSION_KEY = 'concept_synthesis_input_version';
+const CONCEPT_SYNTH_INPUT_SOURCE_KEY = 'concept_synthesis_input_source_id';
+const CONCEPT_SYNTH_INPUT_MODEL_KEY = 'concept_synthesis_model_id';
+const CONCEPT_SYNTH_INPUT_ATOM_COUNT_KEY = 'concept_synthesis_input_atom_count';
 /**
  * Output cap for the per-concept narrative. 500 sizes the *answer* (a
  * 1-paragraph summary) and is ample for a non-reasoning model. It is NOT ample
@@ -112,6 +120,12 @@ interface AtomGroup {
   atomBodies: string[];
   tier: 'T1' | 'T2' | 'T3' | 'T4';
 }
+
+type ConceptInputIdentity =
+  | 'current'
+  | 'changed'
+  | 'unknown'
+  | 'missing';
 
 type ConceptSynthesisMode =
   | 'llm'
@@ -225,6 +239,11 @@ export async function runPhaseSynthesizeConcepts(
 
   // 4. Per group: synthesize narrative (LLM for T1/T2, deterministic for T3+)
   let conceptsWritten = 0;
+  let conceptsSynthesized = 0;
+  let conceptsUnchanged = 0;
+  let conceptsPreserved = 0;
+  let conceptsUnfinished = 0;
+  let legacyInputUnknown = 0;
   let estimatedSpendUsd = 0;
   const budgetCap = DEFAULT_BUDGET_USD;
   const failures: Array<{ concept: string; error: string }> = [];
@@ -275,12 +294,41 @@ export async function runPhaseSynthesizeConcepts(
     fallback: 'sonnet',
   });
   const synthMaxOutputTokens = resolveSynthMaxOutputTokens(synthModel);
-  for (const group of atomGroups) {
+  const sourceId = opts.sourceId ?? 'default';
+  for (let groupIdx = 0; groupIdx < atomGroups.length; groupIdx++) {
+    const group = atomGroups[groupIdx]!;
     tierCounts[group.tier]++;
     let narrative: string;
     let synthesisMode: ConceptSynthesisMode;
+    const title = group.conceptSlug.split('/').pop() ?? group.conceptSlug;
+    const conceptSlug = `concepts/${title}`;
+    const inputFingerprint = conceptInputFingerprint(group, sourceId, synthModel);
+    const existingConcept = opts.dryRun
+      ? null
+      : await readExistingConcept(engine, conceptSlug, sourceId);
+    const inputIdentity = classifyConceptInput(existingConcept, inputFingerprint, sourceId);
+    if (inputIdentity === 'current' && hasCompletedNarrative(existingConcept)) {
+      conceptsUnchanged++;
+      if (!opts.dryRun) {
+        await writeConceptProvenance(engine, {
+          group,
+          conceptSlug,
+          sourceId,
+          linkWarnings,
+        });
+      }
+      continue;
+    }
+    if (inputIdentity === 'unknown' && hasUsefulNarrative(existingConcept)) {
+      legacyInputUnknown++;
+    }
     if (group.tier === 'T1' || group.tier === 'T2') {
       if (estimatedSpendUsd >= budgetCap) {
+        if (hasUsefulNarrative(existingConcept)) {
+          conceptsPreserved++;
+          conceptsUnfinished++;
+          continue;
+        }
         narrative = deterministicNarrative(group);
         synthesisMode = 'budget_fallback';
       } else {
@@ -322,6 +370,11 @@ export async function runPhaseSynthesizeConcepts(
             synthesisMode = 'llm';
           } else {
             failures.push({ concept: group.conceptSlug, error: 'empty model response' });
+            if (hasUsefulNarrative(existingConcept)) {
+              conceptsPreserved++;
+              conceptsUnfinished++;
+              continue;
+            }
             narrative = deterministicNarrative(group);
             synthesisMode = 'error_fallback';
           }
@@ -340,10 +393,19 @@ export async function runPhaseSynthesizeConcepts(
               concept: group.conceptSlug,
               error: `aborting phase: ${llmHalt.note()} (${msg})`,
             });
+            conceptsUnfinished += atomGroups.length - groupIdx;
             break;
           }
           failures.push({ concept: group.conceptSlug, error: msg });
-          if (llmHalt.lastClass() === 'rate_limit') continue;
+          if (llmHalt.lastClass() === 'rate_limit') {
+            conceptsUnfinished++;
+            continue;
+          }
+          if (hasUsefulNarrative(existingConcept)) {
+            conceptsPreserved++;
+            conceptsUnfinished++;
+            continue;
+          }
           narrative = deterministicNarrative(group);
           synthesisMode = 'error_fallback';
         }
@@ -353,9 +415,13 @@ export async function runPhaseSynthesizeConcepts(
       synthesisMode = 'deterministic_tier';
     }
     synthesisModeCounts[synthesisMode]++;
+    if (synthesisMode === 'llm' || synthesisMode === 'deterministic_tier') {
+      conceptsSynthesized++;
+    } else {
+      conceptsUnfinished++;
+    }
 
     if (!opts.dryRun) {
-      const title = group.conceptSlug.split('/').pop() ?? group.conceptSlug;
       // #2163: serialize to markdown and import via the canonical pipeline so
       // the page is chunked (+ embedded when a provider is configured) —
       // mirrors put_page's isAvailable('embedding') → noEmbed gate.
@@ -365,6 +431,11 @@ export async function runPhaseSynthesizeConcepts(
           mention_count: group.atomTitles.length,
           composite_score: group.atomTitles.length,
           synthesis_mode: synthesisMode,
+          [CONCEPT_SYNTH_INPUT_FINGERPRINT_KEY]: inputFingerprint,
+          [CONCEPT_SYNTH_INPUT_VERSION_KEY]: CONCEPT_SYNTH_INPUT_VERSION,
+          [CONCEPT_SYNTH_INPUT_SOURCE_KEY]: sourceId,
+          [CONCEPT_SYNTH_INPUT_MODEL_KEY]: synthModel,
+          [CONCEPT_SYNTH_INPUT_ATOM_COUNT_KEY]: group.atomTitles.length,
           synthesized_at: new Date().toISOString(),
           synthesized_by: 'synthesize_concepts-v0.41',
         },
@@ -378,37 +449,12 @@ export async function runPhaseSynthesizeConcepts(
         // #4416: target the cycle's resolved source, not the 'default' literal.
         sourceId: opts.sourceId,
       });
-      // #4589: bank concept<->member-atom provenance edges. The prompt forbids
-      // enumerating atoms in the body and no frontmatter field maps to a link
-      // verb, so without this every concept page lands with zero edges (graph
-      // orphan). Dedicated link_source keeps reconcile passes from pruning
-      // them; both endpoints sit in the cycle's source (an atom living in
-      // another source drops out of the batch JOIN — no cross-source edge).
-      // ON CONFLICT DO NOTHING makes re-runs idempotent, so a failure here is
-      // best-effort: recorded as a warn, the page write stands. Mirrors #3961.
-      const src = opts.sourceId ?? 'default';
-      const provenanceLinks: LinkBatchInput[] = [...new Set(group.atomSlugs)].flatMap((atomSlug) => [
-        { from_slug: conceptSlug, to_slug: atomSlug, link_type: 'synthesized_from', link_source: 'concept-provenance', context: 'member atom', from_source_id: src, to_source_id: src },
-        { from_slug: atomSlug, to_slug: conceptSlug, link_type: 'synthesizes', link_source: 'concept-provenance', context: 'concept synthesized from this atom', from_source_id: src, to_source_id: src },
-      ]);
-      try {
-        const inserted = await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.synthesize_concepts.provenance' }); // gbrain-allow-direct-insert: concept-provenance edges derived from the synthesis itself (no markdown body to reconcile from)
-        // Zero rows back with edges requested means every member atom fell
-        // out of the batch JOIN (not in this source) — unless a prior run
-        // already banked them (ON CONFLICT DO NOTHING also returns 0). A
-        // silent 'ok' here is a graph orphan with a clean receipt.
-        if (inserted === 0 && provenanceLinks.length > 0) {
-          const banked = (await engine.getLinks(conceptSlug, { sourceId: src }))
-            .some((l) => l.link_source === 'concept-provenance');
-          if (!banked) {
-            linkWarnings.push({ concept: group.conceptSlug, warning: `provenance links: 0 of ${provenanceLinks.length} edges landed (member atoms not in source '${src}'?)` });
-          }
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        linkWarnings.push({ concept: group.conceptSlug, warning: `provenance links failed: ${msg}` });
-        console.error(`[synthesize_concepts] provenance links failed for ${conceptSlug} (non-fatal): ${msg}`);
-      }
+      await writeConceptProvenance(engine, {
+        group,
+        conceptSlug,
+        sourceId,
+        linkWarnings,
+      });
     }
     conceptsWritten++;
     // v0.41.19.0 (T4): one tick per concept group with running count.
@@ -425,23 +471,32 @@ export async function runPhaseSynthesizeConcepts(
   // survives only as the fallback for legacy unscoped callers. Receipt only
   // fires when concepts were actually written; rollup always fires so doctor
   // sees the phase ran.
-  if (!opts.dryRun && conceptsWritten > 0) {
+  const hadReportableWork =
+    conceptsWritten > 0 ||
+    conceptsSynthesized > 0 ||
+    conceptsUnchanged > 0 ||
+    conceptsPreserved > 0 ||
+    conceptsUnfinished > 0;
+  if (!opts.dryRun && hadReportableWork) {
     const runId = `concepts-${Date.now().toString(36)}`;
     try {
       await writeReceipt(engine, {
         kind: 'concepts',
-        source_id: opts.sourceId ?? 'default',
+        source_id: sourceId,
         run_id: runId,
         round: 'single',
         extracted_at: new Date().toISOString(),
-        total_rows: conceptsWritten,
+        total_rows: conceptsSynthesized,
         cost_usd: estimatedSpendUsd,
         summary:
-          `Synthesized ${conceptsWritten} concepts ` +
+          `Synthesized ${conceptsSynthesized} concepts ` +
+          `(written=${conceptsWritten} unchanged=${conceptsUnchanged} ` +
+          `preserved=${conceptsPreserved} unfinished=${conceptsUnfinished}) ` +
           `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3}) ` +
           `(llm=${synthesisModeCounts.llm} deterministic=${synthesisModeCounts.deterministic_tier} ` +
           `budget_fallback=${synthesisModeCounts.budget_fallback} error_fallback=${synthesisModeCounts.error_fallback}) ` +
-          `from ${atomGroups.length} groups across ${atoms.length} atoms.`,
+          `from ${atomGroups.length} groups across ${atoms.length} atoms` +
+          (legacyInputUnknown > 0 ? `; ${legacyInputUnknown} preserved/read legacy input identity as unknown.` : '.'),
       });
     } catch (err) {
       console.error(`[synthesize_concepts] receipt write failed: ${(err as Error).message}`);
@@ -450,24 +505,32 @@ export async function runPhaseSynthesizeConcepts(
   if (!opts.dryRun) {
     await upsertExtractRollup(engine, {
       kind: 'concepts',
-      source_id: opts.sourceId ?? 'default',
+      source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: failures.length === 0 ? 1 : 0,
-      halt_delta: failures.length > 0 ? 1 : 0,
+      round_completed_delta: failures.length === 0 && conceptsUnfinished === 0 ? 1 : 0,
+      halt_delta: failures.length > 0 || conceptsUnfinished > 0 ? 1 : 0,
     });
   }
 
   return {
     phase: 'synthesize_concepts',
-    status: failures.length > 0 || linkWarnings.length > 0 ? 'warn' : 'ok',
+    status: failures.length > 0 || linkWarnings.length > 0 || conceptsUnfinished > 0 ? 'warn' : 'ok',
     duration_ms: 0,
     summary:
-      `synthesize_concepts: ${conceptsWritten} concepts ` +
+      `synthesize_concepts: ${conceptsSynthesized} synthesized, ` +
+      `${conceptsUnchanged} unchanged, ${conceptsPreserved} preserved, ` +
+      `${conceptsUnfinished} unfinished ` +
+      `(${conceptsWritten} written) ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
       (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
       (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : ''),
     details: {
       concepts_written: conceptsWritten,
+      concepts_synthesized: conceptsSynthesized,
+      concepts_unchanged: conceptsUnchanged,
+      concepts_preserved: conceptsPreserved,
+      concepts_unfinished: conceptsUnfinished,
+      legacy_input_unknown: legacyInputUnknown,
       tier_counts: tierCounts,
       synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
@@ -480,6 +543,114 @@ export async function runPhaseSynthesizeConcepts(
       dry_run: opts.dryRun ?? false,
     },
   };
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function conceptInputFingerprint(group: AtomGroup, sourceId: string, modelId: string): string {
+  const members = group.atomSlugs.map((slug, idx) => ({
+    slug,
+    title: group.atomTitles[idx] ?? '',
+    body_sha256: sha256(group.atomBodies[idx] ?? ''),
+  })).sort((a, b) =>
+    a.slug.localeCompare(b.slug) ||
+    a.title.localeCompare(b.title) ||
+    a.body_sha256.localeCompare(b.body_sha256));
+  return sha256(JSON.stringify({
+    version: CONCEPT_SYNTH_INPUT_VERSION,
+    source_id: sourceId,
+    model_id: modelId,
+    concept_slug: group.conceptSlug,
+    members,
+  }));
+}
+
+function classifyConceptInput(
+  page: Page | null,
+  currentFingerprint: string,
+  sourceId: string,
+): ConceptInputIdentity {
+  if (!page) return 'missing';
+  const fm = page.frontmatter ?? {};
+  const version = fm[CONCEPT_SYNTH_INPUT_VERSION_KEY];
+  const priorSource = fm[CONCEPT_SYNTH_INPUT_SOURCE_KEY];
+  const priorModel = fm[CONCEPT_SYNTH_INPUT_MODEL_KEY];
+  const priorFingerprint = fm[CONCEPT_SYNTH_INPUT_FINGERPRINT_KEY];
+  if (
+    version !== CONCEPT_SYNTH_INPUT_VERSION ||
+    priorSource !== sourceId ||
+    typeof priorModel !== 'string' ||
+    typeof priorFingerprint !== 'string'
+  ) {
+    return 'unknown';
+  }
+  return priorFingerprint === currentFingerprint ? 'current' : 'changed';
+}
+
+function hasUsefulNarrative(page: Page | null): page is Page {
+  return typeof page?.compiled_truth === 'string' && page.compiled_truth.trim().length > 0;
+}
+
+function hasCompletedNarrative(page: Page | null): page is Page {
+  if (!hasUsefulNarrative(page)) return false;
+  const mode = page.frontmatter?.synthesis_mode;
+  return mode === 'llm' || mode === 'deterministic_tier';
+}
+
+async function readExistingConcept(
+  engine: BrainEngine,
+  conceptSlug: string,
+  sourceId: string,
+): Promise<Page | null> {
+  try {
+    return await engine.getPage(conceptSlug, { sourceId });
+  } catch {
+    return null;
+  }
+}
+
+async function writeConceptProvenance(
+  engine: BrainEngine,
+  opts: {
+    group: AtomGroup;
+    conceptSlug: string;
+    sourceId: string;
+    linkWarnings: Array<{ concept: string; warning: string }>;
+  },
+): Promise<void> {
+  const { group, conceptSlug, sourceId, linkWarnings } = opts;
+  // #4589: bank concept<->member-atom provenance edges. The prompt forbids
+  // enumerating atoms in the body and no frontmatter field maps to a link
+  // verb, so without this every concept page lands with zero edges (graph
+  // orphan). Dedicated link_source keeps reconcile passes from pruning
+  // them; both endpoints sit in the cycle's source (an atom living in
+  // another source drops out of the batch JOIN — no cross-source edge).
+  // ON CONFLICT DO NOTHING makes re-runs idempotent, so a failure here is
+  // best-effort: recorded as a warn, the page write stands. Mirrors #3961.
+  const provenanceLinks: LinkBatchInput[] = [...new Set(group.atomSlugs)].flatMap((atomSlug) => [
+    { from_slug: conceptSlug, to_slug: atomSlug, link_type: 'synthesized_from', link_source: 'concept-provenance', context: 'member atom', from_source_id: sourceId, to_source_id: sourceId },
+    { from_slug: atomSlug, to_slug: conceptSlug, link_type: 'synthesizes', link_source: 'concept-provenance', context: 'concept synthesized from this atom', from_source_id: sourceId, to_source_id: sourceId },
+  ]);
+  try {
+    const inserted = await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.synthesize_concepts.provenance' }); // gbrain-allow-direct-insert: concept-provenance edges derived from the synthesis itself (no markdown body to reconcile from)
+    // Zero rows back with edges requested means every member atom fell
+    // out of the batch JOIN (not in this source) — unless a prior run
+    // already banked them (ON CONFLICT DO NOTHING also returns 0). A
+    // silent 'ok' here is a graph orphan with a clean receipt.
+    if (inserted === 0 && provenanceLinks.length > 0) {
+      const banked = (await engine.getLinks(conceptSlug, { sourceId }))
+        .some((l) => l.link_source === 'concept-provenance');
+      if (!banked) {
+        linkWarnings.push({ concept: group.conceptSlug, warning: `provenance links: 0 of ${provenanceLinks.length} edges landed (member atoms not in source '${sourceId}'?)` });
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    linkWarnings.push({ concept: group.conceptSlug, warning: `provenance links failed: ${msg}` });
+    console.error(`[synthesize_concepts] provenance links failed for ${conceptSlug} (non-fatal): ${msg}`);
+  }
 }
 
 /**
