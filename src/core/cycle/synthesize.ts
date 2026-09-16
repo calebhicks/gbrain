@@ -96,6 +96,17 @@ import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_
 // by PAGE_SLUG_SEG's \p{...} classes (#3417).
 const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'u');
 
+function orderTranscriptsForTriage(transcripts: DiscoveredTranscript[]): DiscoveredTranscript[] {
+  return transcripts.sort((a, b) => {
+    if (a.inferredDate && b.inferredDate && a.inferredDate !== b.inferredDate) {
+      return b.inferredDate.localeCompare(a.inferredDate);
+    }
+    if (a.inferredDate && !b.inferredDate) return -1;
+    if (!a.inferredDate && b.inferredDate) return 1;
+    return a.filePath.localeCompare(b.filePath);
+  });
+}
+
 // ── Model context budget (D1, D5, D7, D9) ─────────────────────────────
 
 /** Token-to-char ratio. 3.5 matches PR #748; conservative for English text. */
@@ -476,6 +487,7 @@ async function runPhaseSynthesizeInner(
           to: opts.to,
           bypassGuard: opts.bypassDreamGuard,
         });
+    orderTranscriptsForTriage(transcripts);
 
     if (transcripts.length === 0) {
       return ok('no transcripts to process', { transcripts_processed: 0, pages_written: 0 });
