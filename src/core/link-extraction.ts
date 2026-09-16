@@ -513,6 +513,20 @@ function maskRanges(content: string, ranges: Array<[number, number]>): string {
 }
 
 /**
+ * Mask external URI/network URL spans before the bare-path prose pass runs.
+ * Explicit markdown and wikilink passes own authored links; the broad bare
+ * path regex must not treat URL paths, query params, or fragments such as
+ * `https://example.test/#companies/acme` as internal graph assertions.
+ */
+function maskExternalUriSpans(content: string): string {
+  const re = /\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"')\]]+|(^|[^a-z0-9+.-])(\/\/[^\s<>"')\]]+)/gi;
+  return content.replace(re, (span, prefix: string | undefined, network: string | undefined) => {
+    if (network) return `${prefix ?? ''}${' '.repeat(network.length)}`;
+    return ' '.repeat(span.length);
+  });
+}
+
+/**
  * Resolve a markdown ref's target against the LINKING page's directory when the
  * original link was relative (had one or more `../`). Filesystem markdown links
  * are relative to the file that contains them: `[x](../concepts/x.md)` from a
@@ -567,6 +581,12 @@ export interface LinkCandidate {
   originSlug?: string;
   /** Frontmatter field name (e.g. 'key_people'), for debug + unresolved report. */
   originField?: string;
+  /**
+   * True only for bare prose slash-path matches. These remain valid shorthand
+   * when they resolve to real pages, but an unresolved miss is discarded
+   * scanner text rather than a dangling authored markdown/frontmatter ref.
+   */
+  speculative?: boolean;
 }
 
 /**
@@ -780,8 +800,11 @@ export async function extractPageLinks(
   // 2. Bare slug references (e.g. "see people/alice-chen for context").
   // #2576 (bug 2): any dir-shaped path, not just the DIR_PATTERN whitelist —
   // `see ops/services/pointer-agent` must produce a candidate. Prose noise
-  // that happens to look like a path (`on/off`, `com/foo/bar` inside a URL)
-  // is dropped by the callers' page-existence checks, never persisted.
+  // that happens to look like a path (`on/off`, `9/14`, `com/calendar`) is
+  // tagged speculative so missing misses are discarded separately from real
+  // dangling authored refs. External URI spans are masked first so URL
+  // paths/fragments never become internal edges just because a matching page
+  // exists.
   // Code blocks are stripped first — slugs in code samples are not real refs.
   // Wikilink spans are masked too (equal-length blanks, so match indices stay
   // valid for excerpt()): the wikilink pass above owns `[[...]]` interiors,
@@ -789,8 +812,10 @@ export async function extractPageLinks(
   // `[[llm-wiki/entities/AI 3.0]]` leaves its lowercase prefix
   // `llm-wiki/entities` as a bare-path match — a spurious edge to the parent
   // page whenever that page exists.
-  const strippedContent = stripCodeBlocks(content)
-    .replace(/\[\[[^\]]*\]\]/g, (s) => ' '.repeat(s.length));
+  const strippedContent = maskExternalUriSpans(
+    stripCodeBlocks(content)
+      .replace(/\[\[[^\]]*\]\]/g, (s) => ' '.repeat(s.length)),
+  );
   const bareRe = new RegExp(
     `\\b(${ANY_DIR_SEGMENT}\\/[a-z0-9][a-z0-9/-]*[a-z0-9])\\b`,
     'g',
@@ -808,6 +833,7 @@ export async function extractPageLinks(
       linkType: typeFor(context, m[1]),
       context,
       linkSource: 'markdown',
+      speculative: true,
     });
   }
 

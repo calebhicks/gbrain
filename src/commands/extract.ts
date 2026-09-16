@@ -346,6 +346,7 @@ interface ExtractResult {
   /** #2589: drop counters, present on the DB links path only (additive). */
   skipped_missing_target?: number;
   skipped_cross_source?: number;
+  discarded_speculative_candidates?: number;
 }
 
 // --- Shared walker ---
@@ -1209,6 +1210,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
           // additive fields, only present on the DB links path.
           result.skipped_missing_target = r.skippedMissingTarget;
           result.skipped_cross_source = r.skippedCrossSource;
+          result.discarded_speculative_candidates = r.discardedSpeculativeCandidates;
         }
         if (subcommand === 'timeline' || subcommand === 'all') {
           const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter, inferDates });
@@ -1692,7 +1694,7 @@ async function extractLinksFromDB(
   typeFilter: PageType | undefined,
   since: string | undefined,
   opts?: { includeFrontmatter?: boolean; sourceIdFilter?: string; stampWatermark?: boolean },
-): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[]; skippedMissingTarget: number; skippedCrossSource: number }> {
+): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[]; skippedMissingTarget: number; skippedCrossSource: number; discardedSpeculativeCandidates: number }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
   const sourceIdFilter = opts?.sourceIdFilter;
   // C3 (D6): the links_extracted_at watermark covers links AND timeline, so a
@@ -1772,6 +1774,7 @@ async function extractLinksFromDB(
   let processed = 0, created = 0;
   // #2576: skipped-candidate counter — see extractStaleFromDB's twin.
   let skippedMissingTarget = 0;
+  let discardedSpeculativeCandidates = 0;
   // #2589: target resolved (via global_basename) to a page that exists only
   // in a source other than the origin's or 'default' — default-deny by
   // design (source isolation) unless the #3908 flag is on, but distinct
@@ -1834,7 +1837,8 @@ async function extractLinksFromDB(
         { crossSource, defaultSourceId: linkDefaultSourceId },
       );
       if (!resolved.ok) {
-        if (resolved.reason === 'cross_source') skippedCrossSource++;
+        if (c.speculative) discardedSpeculativeCandidates++;
+        else if (resolved.reason === 'cross_source') skippedCrossSource++;
         else skippedMissingTarget++;
         continue;
       }
@@ -1897,6 +1901,9 @@ async function extractLinksFromDB(
     if (skippedMissingTarget > 0) {
       console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
     }
+    if (discardedSpeculativeCandidates > 0) {
+      console.log(`Discarded ${discardedSpeculativeCandidates} speculative bare-path candidate(s) that did not resolve to an allowed page.`);
+    }
     if (skippedCrossSource > 0) {
       console.log(`Skipped ${skippedCrossSource} cross-source candidate(s) — target exists only in another source. Enable with \`gbrain config set link_resolution.cross_source true\` — see docs/architecture/brains-and-sources.md (#2589).`);
     }
@@ -1918,7 +1925,7 @@ async function extractLinksFromDB(
   // #2589: the counters ride the return value so machine consumers (and the
   // --json path, which has no summary event on this path) can see the drops —
   // "counted, never silent" must hold beyond human-mode console lines.
-  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource };
+  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, discardedSpeculativeCandidates };
 }
 
 async function extractTimelineFromDB(
@@ -2057,7 +2064,7 @@ export async function extractStaleFromDB(
      */
     timeBudgetMs?: number;
   },
-): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number }> {
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number; discardedSpeculativeCandidates?: number }> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const log = opts.quiet ? (..._args: unknown[]) => {} : console.log;
   const timeBudgetMs = opts.timeBudgetMs ?? STALE_TIME_BUDGET_MS;
@@ -2126,6 +2133,7 @@ export async function extractStaleFromDB(
   // persisted. Counted so a dropped reference is observable in the summary
   // instead of vanishing silently (the failure mode that hid bug 2).
   let skippedMissingTarget = 0;
+  let discardedSpeculativeCandidates = 0;
   // #2589: target resolved (via global_basename) to a page that exists only
   // in a source other than the origin's or 'default' — default-deny by
   // design (source isolation) unless the #3908 flag is on, but distinct
@@ -2155,7 +2163,8 @@ export async function extractStaleFromDB(
           { crossSource, defaultSourceId: linkDefaultSourceId },
         );
         if (!r.ok) {
-          if (r.reason === 'cross_source') skippedCrossSource++;
+          if (c.speculative) discardedSpeculativeCandidates++;
+          else if (r.reason === 'cross_source') skippedCrossSource++;
           else skippedMissingTarget++;
           continue;
         }
@@ -2226,6 +2235,9 @@ export async function extractStaleFromDB(
     if (skippedMissingTarget > 0) {
       log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
     }
+    if (discardedSpeculativeCandidates > 0) {
+      log(`Discarded ${discardedSpeculativeCandidates} speculative bare-path candidate(s) that did not resolve to an allowed page.`);
+    }
     if (skippedCrossSource > 0) {
       log(`Skipped ${skippedCrossSource} cross-source candidate(s) — target exists only in another source. Enable with \`gbrain config set link_resolution.cross_source true\`, then run \`gbrain extract links --source db\` — a --stale re-run will NOT revisit these pages (their extraction watermark is already stamped) — see docs/architecture/brains-and-sources.md (#2589).`);
     }
@@ -2237,9 +2249,10 @@ export async function extractStaleFromDB(
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
       skipped_missing_target: skippedMissingTarget, skipped_cross_source: skippedCrossSource,
+      discarded_speculative_candidates: discardedSpeculativeCandidates,
     }) + '\n');
   }
-  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource };
+  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource, discardedSpeculativeCandidates };
 }
 
 /**
