@@ -2,8 +2,9 @@
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
  *
- *   discoverTranscripts ──► runTriagePass (bounded pool, dream.triage.max_ms
- *     │                     time budget for cache MISSES; hits are free)
+ *   discoverTranscripts ──► already-completed unchanged key check ──► runTriagePass
+ *     │                     (bounded pool, dream.triage.max_ms time budget
+ *     │                     for cache MISSES; hits are free)
  *     │                       ├─ HIT: score!=null && triage_version==current
  *     │                       │       && model matches ──► reuse
  *     │                       ├─ MISS ──► judgeSignificance (utility model,
@@ -493,6 +494,54 @@ async function runPhaseSynthesizeInner(
       return ok('no transcripts to process', { transcripts_processed: 0, pages_written: 0 });
     }
 
+    const cycleSourceId = opts.sourceId ?? 'default';
+    const successfulLegacyKeys = await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth:');
+    const successfulV2Keys = await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth-v2:');
+    const completedSkips: Array<{ filePath: string; reason: string }> = [];
+    const triageCandidates: DiscoveredTranscript[] = [];
+    for (const t of transcripts) {
+      const hash16 = t.contentHash.slice(0, 16);
+      // Reuse the existing source-qualified completion matchers BEFORE paid
+      // triage. Changed content hashes, partial chunk sets, and no-history
+      // files fall through as incomplete candidates.
+      const legacyCompletion = findLegacyCompletion(successfulLegacyKeys, t.filePath, hash16);
+      if (legacyCompletion) {
+        completedSkips.push({
+          filePath: t.filePath,
+          reason: legacyCompletion === 'chunked'
+            ? 'already_synthesized_legacy_chunked'
+            : 'already_synthesized_legacy_single_chunk',
+        });
+        continue;
+      }
+      const v2Completion = findSynthV2Completion(successfulV2Keys, t.filePath, hash16, cycleSourceId);
+      if (v2Completion) {
+        completedSkips.push({
+          filePath: t.filePath,
+          reason: v2Completion === 'chunked'
+            ? 'already_synthesized_v2_chunked'
+            : 'already_synthesized_v2_single_chunk',
+        });
+        continue;
+      }
+      triageCandidates.push(t);
+    }
+
+    const alreadyCompleteUnchanged = completedSkips.length;
+    if (triageCandidates.length === 0) {
+      return ok(`all ${transcripts.length} transcript(s) already synthesized unchanged`, {
+        transcripts_discovered: transcripts.length,
+        transcripts_already_complete_unchanged: alreadyCompleteUnchanged,
+        transcripts_screening_candidates: 0,
+        transcripts_processed: 0,
+        pages_written: 0,
+        children_submitted: 0,
+        skips: completedSkips,
+        verdicts: [],
+        triage: emptyTriageDetails(config.triage),
+      });
+    }
+
     // Best-effort housekeeping (#4069): expiry is enforced on reads
     // regardless, so a sweep failure must not block synthesis when the
     // database is otherwise usable.
@@ -509,7 +558,7 @@ async function runPhaseSynthesizeInner(
     // configured provider works (Anthropic, DeepSeek, OpenRouter, Voyage,
     // Ollama, llama-server, etc.); an unreachable provider degrades
     // per-transcript inside the pass.
-    const pass = await runTriagePass(engine, transcripts, {
+    const pass = await runTriagePass(engine, triageCandidates, {
       model: config.triage.model,
       maxChars: config.triage.maxChars,
       maxTokens: config.triage.maxTokens,
@@ -527,7 +576,7 @@ async function runPhaseSynthesizeInner(
     // runTriagePass (F2: `worth` = threshold pass OR verified-segment rescue,
     // ONE decision for the fan-out, telemetry, dry-run, and retriage).
     const reportByPath = new Map(pass.reports.map(r => [r.filePath, r]));
-    const worthProcessing = transcripts.filter(t => reportByPath.get(t.filePath)?.worth === true);
+    const worthProcessing = triageCandidates.filter(t => reportByPath.get(t.filePath)?.worth === true);
 
     // Count semantics (outside-voice CX7): below_threshold counts ONLY files
     // with a real score under the gate; degraded = no usable score and not
@@ -560,17 +609,20 @@ async function runPhaseSynthesizeInner(
     };
     // 3A: a time-boxed cold pass must never read as mass rejection.
     const deferralSuffix = pass.deferred > 0
-      ? ` (${pass.deferred} not yet triaged — time budget; re-run or use dream retriage)`
+      ? ` (${pass.deferred} incomplete transcript(s) not yet triaged — screening deferred; time budget; re-run or use dream retriage)`
       : '';
 
     // Dry-run stops here: the triage pass ran (scores cached), but no
     // synthesis. Codex finding #8: --dry-run does NOT mean "zero LLM calls";
     // it means "skip the synthesis model."
     if (opts.dryRun) {
-      return ok(`dry-run: ${worthProcessing.length} of ${transcripts.length} transcripts would synthesize${deferralSuffix}`, {
+      return ok(`dry-run: ${worthProcessing.length} of ${triageCandidates.length} incomplete transcript(s) would synthesize; ${alreadyCompleteUnchanged} already complete unchanged${deferralSuffix}`, {
         transcripts_discovered: transcripts.length,
+        transcripts_already_complete_unchanged: alreadyCompleteUnchanged,
+        transcripts_screening_candidates: triageCandidates.length,
         transcripts_processed: 0,
         pages_written: 0,
+        skips: completedSkips,
         verdicts,
         triage: triageDetails,
         dryRun: true,
@@ -590,8 +642,11 @@ async function runPhaseSynthesizeInner(
           : `no transcripts passed triage${deferralSuffix}`;
       return ok(zeroPassMsg, {
         transcripts_discovered: transcripts.length,
+        transcripts_already_complete_unchanged: alreadyCompleteUnchanged,
+        transcripts_screening_candidates: triageCandidates.length,
         transcripts_processed: 0,
         pages_written: 0,
+        skips: completedSkips,
         verdicts,
         triage: triageDetails,
       });
@@ -615,7 +670,6 @@ async function runPhaseSynthesizeInner(
     // block. Scoped to the cycle's write source so manifest reads see the
     // same universe the oneshot validator probes. Best-effort: a failure
     // here degrades to the manifest-less prompt.
-    const cycleSourceId = opts.sourceId ?? 'default';
     let manifestCtx: ManifestContext | null = null;
     if (config.linkManifest) {
       try {
@@ -648,11 +702,9 @@ async function runPhaseSynthesizeInner(
     /** #1978: map child job_id → source transcript path so written pages get a raw_source stamp. */
     const jobRawSource = new Map<number, string>();
     /** Skip reasons for the cycle report (D5 cap hits, D8 legacy-key skips). */
-    const skipReports: Array<{ filePath: string; reason: string }> = [];
+    const skipReports: Array<{ filePath: string; reason: string }> = [...completedSkips];
 
     const maxCharsPerChunk = computeChunkCharBudget(config.model, config.maxPromptTokens);
-    const successfulLegacyKeys = await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth:');
-    const successfulV2Keys = await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth-v2:');
 
     // Per-source daily submission cap (D2D: default 0 = disabled; opt-in
     // backstop via dream.synthesize.max_submissions_per_source_per_day).
@@ -697,45 +749,6 @@ async function runPhaseSynthesizeInner(
       }
       const hash16 = t.contentHash.slice(0, 16);
       const hash6 = t.contentHash.slice(0, 6);
-
-      // D8: legacy-key migration safety. If this content hash already
-      // completed under the pre-v2 path-based key family — single-chunk OR
-      // a full chunked set — treat as already-synthesized and skip.
-      // Prevents a full paid re-synthesis when the corpus root moves or
-      // the chunking outcome changes across versions.
-      const legacyCompletion = findLegacyCompletion(
-        successfulLegacyKeys,
-        t.filePath,
-        hash16,
-      );
-      if (legacyCompletion) {
-        skipReports.push({
-          filePath: t.filePath,
-          reason: legacyCompletion === 'chunked'
-            ? 'already_synthesized_legacy_chunked'
-            : 'already_synthesized_legacy_single_chunk',
-        });
-        continue;
-      }
-
-      // Same rule for the synth-v2 key family. Without it a transcript whose
-      // children already COMPLETED coalesced onto them via queue.add's
-      // idempotency key — free for the daily cap, but only AFTER the link
-      // manifest (up to 20 searches) was built — and the coalesced children
-      // re-entered writtenRefs, so their old pages were quote-repaired,
-      // restamped and re-embedded every night with nothing new written.
-      const v2Completion = findSynthV2Completion(
-        successfulV2Keys, t.filePath, hash16, opts.sourceId ?? 'default',
-      );
-      if (v2Completion) {
-        skipReports.push({
-          filePath: t.filePath,
-          reason: v2Completion === 'chunked'
-            ? 'already_synthesized_v2_chunked'
-            : 'already_synthesized_v2_single_chunk',
-        });
-        continue;
-      }
 
       const chunks = splitTranscriptByBudget(t.content, t.contentHash, maxCharsPerChunk);
 
@@ -953,8 +966,14 @@ async function runPhaseSynthesizeInner(
     // a run that did no synthesis must not suppress the retry window that
     // would pick these files up.
     if (childIds.length === 0) {
-      return ok(`no synthesis submitted (${skipReports.length} passing file(s) skipped)${deferralSuffix}`, {
+      const fanoutSkipCount = Math.max(0, skipReports.length - alreadyCompleteUnchanged);
+      const skipSummary = alreadyCompleteUnchanged > 0
+        ? `${fanoutSkipCount} passing file(s) skipped, ${alreadyCompleteUnchanged} already complete unchanged`
+        : `${fanoutSkipCount} passing file(s) skipped`;
+      return ok(`no synthesis submitted (${skipSummary})${deferralSuffix}`, {
         transcripts_discovered: transcripts.length,
+        transcripts_already_complete_unchanged: alreadyCompleteUnchanged,
+        transcripts_screening_candidates: triageCandidates.length,
         transcripts_processed: 0,
         pages_written: 0,
         children_submitted: 0,
@@ -1227,6 +1246,8 @@ async function runPhaseSynthesizeInner(
         // fan-out-shape tests) still see what was submitted and how it died.
         {
           transcripts_discovered: transcripts.length,
+          transcripts_already_complete_unchanged: alreadyCompleteUnchanged,
+          transcripts_screening_candidates: triageCandidates.length,
           children_submitted: childIds.length,
           child_outcomes: childOutcomes,
           skips: skipReports,
@@ -1263,13 +1284,15 @@ async function runPhaseSynthesizeInner(
     // deferred 8 of 10 must not report "10 synthesized".
     const submittedTranscripts = Math.max(
       0,
-      worthProcessing.length - skipReports.length - budgetExhaustedDeferrals.length,
+      worthProcessing.length - Math.max(0, skipReports.length - alreadyCompleteUnchanged) - budgetExhaustedDeferrals.length,
     );
     const turnsSamples = childOutcomes.filter(
       (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
     );
     return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
       transcripts_discovered: transcripts.length,
+      transcripts_already_complete_unchanged: alreadyCompleteUnchanged,
+      transcripts_screening_candidates: triageCandidates.length,
       transcripts_processed: submittedTranscripts,
       pages_written: writtenSlugs.length,
       // v0.29: emit the slug list so the recompute_emotional_weight phase can
@@ -2206,6 +2229,24 @@ function priceChatUsd(model: string, tokens: { in: number; out: number; cacheRea
     cache_read_tokens: tokens.cacheRead ?? 0,
   });
   return usd === null ? null : Math.round(usd * 1e6) / 1e6;
+}
+
+function emptyTriageDetails(triage: SynthTriageConfig) {
+  return {
+    threshold: triage.threshold,
+    judged: 0,
+    cache_hits: 0,
+    unreliable: 0,
+    deferred: 0,
+    degraded: 0,
+    below_threshold: 0,
+    tokens_in: 0,
+    tokens_out: 0,
+    cost_usd: priceChatUsd(triage.model, { in: 0, out: 0 }),
+    rescue_band: [triage.rescueFloor, triage.threshold],
+    rescue_checked: 0,
+    rescue_fired: 0,
+  };
 }
 
 export interface TriagePassCfg {
