@@ -140,7 +140,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
         '[--history-days <n>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
         '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)\n' +
-        '       cadence kind: --target ceo|organization --families <family,...> --token-env <VAR> [--account <id>] [--organization <id>] [--dir <path>]\n' +
+        '       cadence kind: --target ceo|organization --families <family,...> --token-env <VAR> [--account <id>] [--dir <path>]\n' +
         '                    (CEO is the only personnel target; vault credentials fail closed)',
     );
     process.exit(2);
@@ -176,7 +176,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   let cTarget: 'ceo' | 'organization' | undefined;
   let cFamilies: string[] = [];
   let cTokenEnv: string | undefined;
-  let cOrganization: string | undefined;
+  let cAccount: string | undefined;
 
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
@@ -203,8 +203,19 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
       }
       continue;
     }
-    if (a === '--account') { gAccount = args[++i]?.trim().toLowerCase(); continue; }
-    if (a === '--organization') { cOrganization = args[++i]?.trim(); continue; }
+    if (a === '--account') {
+      const value = args[++i]?.trim();
+      // Google account lookup historically canonicalizes email addresses;
+      // Cadence account identifiers are provider-owned and case-sensitive.
+      gAccount = value?.toLowerCase();
+      cAccount = value;
+      continue;
+    }
+    if (a === '--organization') {
+      console.error('Error: --organization is not supported by the Cadence provider and is rejected.');
+      process.exit(2);
+      continue;
+    }
     if (a === '--target') {
       const v = args[++i];
       if (v !== 'ceo' && v !== 'organization') { console.error('--target must be "ceo" or "organization".'); process.exit(2); }
@@ -475,8 +486,8 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
     ...(cKind
       ? {
           cadence: {
-            target: cTarget!, families: cFamilies, account: gAccount,
-            organization: cOrganization, tokenEnv: cTokenEnv!,
+            target: cTarget!, families: cFamilies, account: cAccount,
+            tokenEnv: cTokenEnv!,
             dir: ghDir ?? defaultCloneDir(`${id}-cadence`),
           },
         }

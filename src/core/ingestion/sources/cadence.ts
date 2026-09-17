@@ -185,7 +185,6 @@ export interface CadenceSourceConfig {
   kind: 'cadence';
   target: CadenceTarget;
   account?: string;
-  organization?: string;
   personnelTarget?: 'ceo';
   dir: string;
   snapshotPath?: string;
@@ -230,11 +229,10 @@ export function parseCadenceSourceConfig(config: Record<string, unknown>, fallba
   if (families?.length && (target === 'organization' ? families.some((f) => personnelFamilies.has(f)) : families.some((f) => !personnelFamilies.has(f)))) throw new Error('Cadence family subscription does not match its target');
   const dir = typeof config.c_dir === 'string' && config.c_dir.length > 0 ? config.c_dir : fallbackDir;
   const account = config.c_account ?? config.cadence_account;
-  const organization = config.c_organization ?? config.cadence_organization ?? config.organization_id;
   return {
     kind: 'cadence', target, dir,
     ...(typeof account === 'string' ? { account } : {}),
-    ...(typeof organization === 'string' ? { organization } : {}),
+
     ...(target === 'personnel' ? { personnelTarget: 'ceo' as const } : {}),
     ...(families ? { families } : {}),
     ...(typeof config.c_snapshot === 'string' ? { snapshotPath: config.c_snapshot } : {}),

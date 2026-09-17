@@ -202,7 +202,6 @@ export interface AddSourceOpts {
     target: 'ceo' | 'organization';
     families: string[];
     account?: string;
-    organization?: string;
     tokenEnv: string;
     dir: string;
   };
@@ -484,6 +483,13 @@ export async function addSource(
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- opts.google.dir only flows here from the trusted local CLI (sources_add hard-rejects opts.google unless ctx.remote === false); absolutizing the operator's own directory is the #3696 fix
     opts = { ...opts, google: { ...opts.google, dir: resolvePath(msysToNativePath(opts.google.dir)) } };
   }
+  if (opts.cadence) {
+    // Cadence is a provider-backed source, but its materialized state still
+    // binds a local directory to this source. Resolve it before the overlap
+    // check and before creating the directory, just like the other API kinds.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- opts.cadence.dir only flows here from the trusted local CLI
+    opts = { ...opts, cadence: { ...opts.cadence, dir: resolvePath(msysToNativePath(opts.cadence.dir)) } };
+  }
 
   // Q4: pre-flight collision check before any clone work.
   const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
@@ -533,6 +539,8 @@ export async function addSource(
   let finalPath = opts.localPath ?? null;
   if (parsedUrl) {
     finalPath = opts.cloneDir ?? defaultCloneDir(opts.id);
+  } else if (opts.cadence) {
+    finalPath = opts.cadence.dir;
   }
   if (finalPath) await assertNoOverlappingPath(engine, opts.id, finalPath);
 
@@ -692,7 +700,6 @@ export async function addSource(
       c_managed: finalPath === defaultCloneDir(`${opts.id}-cadence`),
       federated: opts.federated ?? true,
       ...(opts.cadence.account ? { c_account: opts.cadence.account } : {}),
-      ...(opts.cadence.organization ? { c_organization: opts.cadence.organization } : {}),
     };
     const displayName = opts.name ?? opts.id;
     await engine.executeRaw(

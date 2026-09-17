@@ -233,16 +233,18 @@ describe('addSource cadence registration -> performSync', () => {
         people: [{ id: 'person-1', name: 'Must not enter organization target' }],
       }));
 
-      const row = await addSource(engine, {
-        id: 'cadence-org',
-        force: true,
-        cadence: {
-          target: 'organization', account: 'synthetic-account', organization: 'synthetic-org',
-          families: ['groups'], tokenEnv: 'SYNTHETIC_CADENCE_TOKEN', dir,
-        },
-      });
+      await runSources(engine, [
+        'add', 'cadence-org', '--kind', 'cadence', '--target', 'organization',
+        '--families', 'groups', '--token-env', 'SYNTHETIC_CADENCE_TOKEN',
+        '--account', 'Synthetic-Account', '--dir', dir,
+      ]);
+      const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> }>(
+        `SELECT id, config FROM sources WHERE id = $1`, ['cadence-org'],
+      );
+      const row = rows[0]!;
       await engine.executeRaw(`UPDATE sources SET config = config || $1::jsonb WHERE id = $2`, [JSON.stringify({ c_snapshot: snapshotPath }), row.id]);
-      expect(row.config).toMatchObject({ kind: 'cadence', c_account: 'synthetic-account', c_organization: 'synthetic-org', c_target: 'organization', c_families: 'groups' });
+      expect(row.config).toMatchObject({ kind: 'cadence', c_account: 'Synthetic-Account', c_target: 'organization', c_families: 'groups' });
+      expect(row.config).not.toHaveProperty('c_organization');
 
       const result = await performSync(engine, { sourceId: row.id, repoPath: dir, noPull: true, noEmbed: true, skipLock: true });
       expect(['first_sync', 'synced', 'up_to_date']).toContain(result.status);
@@ -252,12 +254,39 @@ describe('addSource cadence registration -> performSync', () => {
     });
   });
 
-  test('rejects a managed directory overlap before registration', async () => {
+  test('real CLI cadence registration rejects a managed directory overlap', async () => {
     await withEnv2(async () => {
       const dir = join(FAKE_GIT_DIR, 'cadence-overlap');
       mkdirSync(dir, { recursive: true });
       await addSource(engine, { id: 'cadence-parent', localPath: dir, force: true });
-      await expect(addSource(engine, { id: 'cadence-child', localPath: join(dir, 'child'), force: true, cadence: { target: 'organization', families: ['groups'], tokenEnv: 'SYNTHETIC_CADENCE_TOKEN', dir: join(dir, 'child') } })).rejects.toThrow(/overlaps with existing source/);
+      await expect(runSources(engine, [
+        'add', 'cadence-child', '--kind', 'cadence', '--target', 'organization',
+        '--families', 'groups', '--token-env', 'SYNTHETIC_CADENCE_TOKEN',
+        '--dir', join(dir, 'child'),
+      ])).rejects.toThrow(/overlaps with existing source/);
+      expect(existsSync(join(dir, 'child'))).toBe(false);
+    });
+  });
+
+  test('real CLI rejects the unsupported no-op --organization scope flag', async () => {
+    await withEnv2(async () => {
+      const errors: string[] = [];
+      const originalError = console.error;
+      const originalExit = process.exit;
+      console.error = (...args: unknown[]) => errors.push(args.join(' '));
+      process.exit = ((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as never;
+      try {
+        await expect(runSources(engine, [
+          'add', 'cadence-org-scope', '--kind', 'cadence', '--target', 'organization',
+          '--families', 'groups', '--token-env', 'SYNTHETIC_CADENCE_TOKEN',
+          '--organization', 'Acme',
+        ])).rejects.toThrow('exit:2');
+      } finally {
+        console.error = originalError;
+        process.exit = originalExit;
+      }
+      expect(errors).toEqual(['Error: --organization is not supported by the Cadence provider and is rejected.']);
+      expect(await engine.executeRaw(`SELECT id FROM sources WHERE id = $1`, ['cadence-org-scope'])).toEqual([]);
     });
   });
 });
