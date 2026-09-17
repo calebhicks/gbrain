@@ -209,11 +209,13 @@ export const ALL_PHASES: CyclePhase[] = [
  * brain-wide phases in the single maintenance job instead of being repeated
  * into every source. Most SOURCE_BACKGROUND_PHASES have no automatic lane on
  * multi-source brains yet — they run on explicit invocation
- * (`gbrain dream --source X --phase extract_atoms`) until the background
- * lane lands (see TODOS). `synthesize_concepts` is the narrow exception:
- * its implementation is already source-local, bounded, and source-qualified,
- * so scheduled source rotation includes it without admitting every
- * source-background phase.
+ * (`gbrain dream --source X --phase …`) until the background lane lands (see
+ * TODOS). The two lens-pack phases are the narrow exception: both are
+ * source-local, bounded, source-qualified, and already pack-gated, so
+ * scheduled source rotation can admit them without admitting every
+ * source-background phase. `extract_atoms` retains its own per-phase budget,
+ * cancellation, cycle lock, and active-pack gate; packs that opt out do not
+ * spend anything.
  *
  * SOURCE_PHASES ∪ MIXED_PHASES ∪ GLOBAL_PHASES == ALL_PHASES, with no overlap.
  * MAINTENANCE_PHASES is MIXED ∪ GLOBAL in original cycle order.
@@ -231,6 +233,7 @@ export const SOURCE_BACKGROUND_PHASES: CyclePhase[] = SOURCE_PHASES.filter(
 /** Per-source phases admitted to scheduled source-rotation jobs. */
 export const SCHEDULED_SOURCE_PHASES: CyclePhase[] = [
   ...SOURCE_FRESHNESS_PHASES,
+  'extract_atoms',
   'synthesize_concepts',
 ];
 

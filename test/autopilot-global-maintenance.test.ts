@@ -65,11 +65,11 @@ describe('cycle phase partition (#2194 fix #3)', () => {
     expect(MAINTENANCE_PHASES).not.toContain('synthesize_concepts');
   });
 
-  test('source freshness excludes LLM-backed/background source work except scheduled concept synthesis', () => {
+  test('source freshness excludes background work; scheduled lens phases are bounded and pack-gated', () => {
     expect(new Set([...SOURCE_FRESHNESS_PHASES, ...SOURCE_BACKGROUND_PHASES])).toEqual(new Set(SOURCE_PHASES));
     expect(SOURCE_FRESHNESS_PHASES).toContain('sync');
     expect(SOURCE_FRESHNESS_PHASES).toContain('extract_facts');
-    expect(SCHEDULED_SOURCE_PHASES).toEqual([...SOURCE_FRESHNESS_PHASES, 'synthesize_concepts']);
+    expect(SCHEDULED_SOURCE_PHASES).toEqual([...SOURCE_FRESHNESS_PHASES, 'extract_atoms', 'synthesize_concepts']);
     expect(SOURCE_BACKGROUND_PHASES).toContain('extract_atoms');
     expect(SOURCE_BACKGROUND_PHASES).toContain('synthesize_concepts');
     expect(SOURCE_BACKGROUND_PHASES).toContain('consolidate');
@@ -220,7 +220,7 @@ describe('dispatchGlobalMaintenance — single-flight gate', () => {
 });
 
 describe('dispatchPerSource — per-source jobs carry scheduled source phases only', () => {
-  test('each per-source job includes concept synthesis but excludes mixed and global phases', async () => {
+  test('each per-source job includes bounded lens phases but excludes mixed and global phases', async () => {
     const sources = [{ id: 'repo-a', name: 'a', config: {} }, { id: 'repo-b', name: 'b', config: {} }];
     const added: any[] = [];
     const engine = {
@@ -234,11 +234,13 @@ describe('dispatchPerSource — per-source jobs carry scheduled source phases on
     expect(added.length).toBe(2);
     for (const j of added) {
       expect(j.data.phases).toEqual(SCHEDULED_SOURCE_PHASES);
+      expect(j.data.phases.indexOf('extract_atoms')).toBeLessThan(j.data.phases.indexOf('synthesize_concepts'));
       expect(j.data.phases).toContain('synthesize_concepts');
+      expect(j.data.phases).toContain('extract_atoms');
       expect(j.data.phases).not.toContain('synthesize');
       expect(j.data.phases).not.toContain('patterns');
       expect(j.data.phases).not.toContain('embed');
-      expect(j.data.phases).not.toContain('extract_atoms');
+
     }
   });
 });
@@ -275,9 +277,13 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
       signal: undefined,
     });
     expect(result.phases_rejected_by_normalization)
-      .toEqual(['synthesize', 'patterns', 'extract_atoms', 'consolidate']);
-    // Only the scheduled subset present in the payload reached runCycle.
-    expect(result.report.phases.map((p: any) => p.phase)).toEqual(['sync', 'extract']);
+      .toEqual(['synthesize', 'patterns', 'consolidate']);
+    // Only the scheduled subset present in the payload reached runCycle. The
+    // pack-gated extract phase is admitted but must spend nothing on gbrain-base.
+    expect(result.report.phases.map((p: any) => p.phase)).toEqual(['sync', 'extract', 'extract_atoms']);
+    const atoms = result.report.phases.find((p: any) => p.phase === 'extract_atoms');
+    expect(atoms.status).toBe('skipped');
+    expect(atoms.details.reason).toBe('not_in_active_pack');
   });
 
   test('autopilot-cycle admits synthesize_concepts for a non-default eligible source', async () => {
