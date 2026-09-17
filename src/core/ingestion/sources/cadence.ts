@@ -188,7 +188,10 @@ export interface CadenceSourceConfig {
   personnelTarget?: 'ceo';
   dir: string;
   snapshotPath?: string;
-  token?: string;
+  /** Name of the runtime environment variable containing the token. */
+  tokenEnv?: string;
+  /** Reserved runtime vault reference; the secret itself is never persisted. */
+  tokenVault?: string;
   endpoint?: string;
 }
 
@@ -202,6 +205,7 @@ export interface CadenceProvider {
 export interface CadenceSyncDeps { provider?: CadenceProvider; readFile?: (path: string) => string; }
 
 const PERSONNEL_FAMILIES = ['people', 'pulse_reflections', 'checkins'] as const;
+const MAX_PROVIDER_PAGES = 100;
 
 export function parseCadenceSourceConfig(config: Record<string, unknown>, fallbackDir: string): CadenceSourceConfig {
   if (config.kind !== 'cadence') throw new Error('Cadence source requires config.kind="cadence"');
@@ -219,7 +223,11 @@ export function parseCadenceSourceConfig(config: Record<string, unknown>, fallba
     ...(typeof organization === 'string' ? { organization } : {}),
     ...(target === 'personnel' ? { personnelTarget: 'ceo' as const } : {}),
     ...(typeof config.c_snapshot === 'string' ? { snapshotPath: config.c_snapshot } : {}),
-    ...(typeof config.c_token === 'string' ? { token: config.c_token } : {}),
+    ...(Object.prototype.hasOwnProperty.call(config, 'c_token')
+      ? (() => { throw new Error('Cadence c_token inline secret config is rejected; use c_token_env or c_token_vault'); })()
+      : {}),
+    ...(typeof config.c_token_env === 'string' && config.c_token_env.length > 0 ? { tokenEnv: config.c_token_env } : {}),
+    ...(typeof config.c_token_vault === 'string' && config.c_token_vault.length > 0 ? { tokenVault: config.c_token_vault } : {}),
     ...(typeof config.c_endpoint === 'string' ? { endpoint: config.c_endpoint } : {}),
   };
 }
@@ -262,12 +270,20 @@ function cadenceMarkdown(record: SnapshotRecord, exportedAt: string): string {
   return `---\ntitle: ${JSON.stringify(`${record.family} ${record.id}`)}\ncadence_family: ${record.family}\ncadence_record_id: ${JSON.stringify(record.id)}\ncadence_exported_at: ${JSON.stringify(exportedAt)}\n---\n\n${canonicalJson(record.value)}\n`;
 }
 
+export async function findCadencePage(engine: BrainEngine, slug: string, sourceId: string): Promise<Array<{ slug: string }>> {
+  return engine.executeRaw<{ slug: string }>(
+    'SELECT slug FROM pages WHERE slug = $1 AND source_id = $2 AND deleted_at IS NULL',
+    [slug, sourceId],
+  );
+}
+
 /** Minimal MCP read client modeled on cadence-fetch.ts. Tests should inject a
  * provider; this default has no credential lookup and never writes snapshots. */
 export function createCadenceProvider(fetchImpl: typeof fetch = fetch): CadenceProvider {
   return { async read(config, cursor, opts) {
     const endpoint = config.endpoint ?? 'https://cadence.schoolai.com/api/mcp';
-    const token = config.token ?? '';
+    const token = config.tokenEnv ? process.env[config.tokenEnv] ?? '' : '';
+    if (config.tokenVault) throw new Error('Cadence vault token references require a configured runtime vault resolver');
     if (!token) throw new Error('Cadence provider token is not configured');
     let callId = 0;
     const call = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
@@ -280,11 +296,22 @@ export function createCadenceProvider(fetchImpl: typeof fetch = fetch): CadenceP
       return JSON.parse(text);
     };
     const family = async (name: string, args: Record<string, unknown> = {}): Promise<unknown[]> => {
-      const rows: unknown[] = []; for (let offset = 0; ; offset += 100) {
+      const rows: unknown[] = [];
+      const seenPages = new Set<string>();
+      const seenCursors = new Set<string>();
+      for (let pageNumber = 0, offset = 0; pageNumber < MAX_PROVIDER_PAGES; pageNumber++, offset += 100) {
         const value = await call(name, { ...args, offset, limit: 100 });
         const page = Array.isArray(value) ? value : ((value as Record<string, unknown>).items ?? (value as Record<string, unknown>)[name] ?? []) as unknown[];
+        const pageKey = canonicalJson(page);
+        if (page.length > 0 && seenPages.has(pageKey)) throw new Error(`Cadence ${name} returned a repeated page`);
+        seenPages.add(pageKey);
+        const nextCursor = isObject(value) && typeof (value.nextCursor ?? value.next_cursor ?? value.cursor) === 'string'
+          ? String(value.nextCursor ?? value.next_cursor ?? value.cursor) : null;
+        if (nextCursor !== null && seenCursors.has(nextCursor)) throw new Error(`Cadence ${name} returned a repeated cursor`);
+        if (nextCursor !== null) seenCursors.add(nextCursor);
         rows.push(...page); if (page.length === 0 || (isObject(value) && value.hasMore === false)) return rows;
       }
+      throw new Error(`Cadence ${name} exceeded the ${MAX_PROVIDER_PAGES}-page limit`);
     };
     const snapshot: Record<string, unknown> = { exported_at: new Date().toISOString(), workspace: await call('workspace_metadata', {}) };
     snapshot.groups = await family('people_read', { method: 'list_groups' });
@@ -322,7 +349,7 @@ export async function runCadenceSync(
   let added = 0, modified = 0, chunksCreated = 0; const pagesAffected: string[] = [];
   for (const record of records) {
     const slug = `cadence/${cfg.target}/${record.family}/${record.id}`;
-    const existing = await engine.executeRaw<{ slug: string }>('SELECT slug FROM pages WHERE slug = $1 AND deleted_at IS NULL', [slug]);
+    const existing = await findCadencePage(engine, slug, sourceId);
     const imported = await importFromContent(engine, slug, cadenceMarkdown(record, raw.exported_at), { noEmbed: opts.noEmbed ?? true, sourceId, sourcePath: `${record.family}/${record.id}.md` });
     if (imported.status === 'error') throw new Error(imported.error ?? `Cadence import failed for ${slug}`);
     if (imported.status === 'imported') { pagesAffected.push(imported.slug); chunksCreated += imported.chunks; if (existing.length) modified++; else added++; }

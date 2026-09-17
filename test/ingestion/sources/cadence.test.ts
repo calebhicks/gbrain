@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { CadenceSnapshotSource, canonicalJson, parseCadenceSourceConfig, runCadenceSync, cadenceStateFile } from '../../../src/core/ingestion/sources/cadence.ts';
+import { CadenceSnapshotSource, canonicalJson, createCadenceProvider, findCadencePage, parseCadenceSourceConfig, runCadenceSync, cadenceStateFile } from '../../../src/core/ingestion/sources/cadence.ts';
 import { IngestionTestHarness } from '../../../src/core/ingestion/test-harness.ts';
 
 const snapshot = {
@@ -103,5 +103,34 @@ describe('canonicalJson', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('rejects inline tokens and only carries a runtime environment pointer', () => {
+    expect(() => parseCadenceSourceConfig({ kind: 'cadence', c_token: 'synthetic-not-a-token' }, '/tmp/cadence')).toThrow(/inline secret config/);
+    const cfg = parseCadenceSourceConfig({ kind: 'cadence', c_token_env: 'GBRAIN_TEST_CADENCE_TOKEN' }, '/tmp/cadence');
+    expect(cfg).not.toHaveProperty('token');
+    expect(cfg).toMatchObject({ tokenEnv: 'GBRAIN_TEST_CADENCE_TOKEN' });
+  });
+
+  test('bounds a provider that never signals the end of pagination', async () => {
+    process.env.GBRAIN_TEST_CADENCE_TOKEN = 'synthetic-token';
+    let groupCalls = 0;
+    const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { params: { name: string } };
+      if (body.params.name === 'workspace_metadata') return new Response(JSON.stringify({ result: { content: [{ text: JSON.stringify({ id: 'w' }) }] } }));
+      groupCalls++;
+      return new Response(JSON.stringify({ result: { content: [{ text: JSON.stringify([{ id: `group-${groupCalls}` }]) }] } }));
+    };
+    await expect(createCadenceProvider(fetchImpl as typeof fetch).read(parseCadenceSourceConfig({ kind: 'cadence', c_token_env: 'GBRAIN_TEST_CADENCE_TOKEN' }, '/tmp/cadence'), null)).rejects.toThrow(/page limit/);
+    expect(groupCalls).toBe(100);
+    delete process.env.GBRAIN_TEST_CADENCE_TOKEN;
+  });
+
+  test('scopes same-slug existence checks to the source', async () => {
+    const calls: unknown[][] = [];
+    const engine = { executeRaw: async (_sql: string, params: unknown[]) => { calls.push(params); return params[1] === 'source-a' ? [{ slug: 'same-slug' }] : []; } } as never;
+    expect(await findCadencePage(engine, 'same-slug', 'source-a')).toEqual([{ slug: 'same-slug' }]);
+    expect(await findCadencePage(engine, 'same-slug', 'source-b')).toEqual([]);
+    expect(calls).toEqual([['same-slug', 'source-a'], ['same-slug', 'source-b']]);
   });
 });
