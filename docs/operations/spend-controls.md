@@ -70,6 +70,13 @@ the tracker cannot price — e.g. a local Ollama model selected via
 warning (a USD cap cannot be enforced on an unpriced model; local models incur
 no API spend).
 
+The `$0.30` limit is **per source per phase invocation** (`$0.30/source/run`),
+not a rolling or calendar-day cap. Separate scheduled runs each receive a fresh
+phase budget; there is no hidden per-day aggregate in this control. The phase
+also remains opt-in at the active schema-pack boundary: a scheduled cycle does
+not activate or configure a pack, and packs that do not declare `extract_atoms`
+are skipped without spending.
+
 ### Sync inline-embed cost gate
 
 Fires only when sync embeds **inline** (federated_v2 off, or `--serial` without
