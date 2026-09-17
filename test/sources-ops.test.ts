@@ -31,6 +31,7 @@ import {
 } from '../src/core/sources-ops.ts';
 import { readdirSync } from 'fs';
 import { runSources } from '../src/commands/sources.ts';
+import { performSync } from '../src/commands/sync.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -214,6 +215,49 @@ describe('addSource — happy paths', () => {
         expect(e).toBeInstanceOf(SourceOpError);
         expect((e as SourceOpError).code).toBe('invalid_remote_url');
       }
+    });
+  });
+});
+
+describe('addSource cadence registration -> performSync', () => {
+  test('persists account/organization, honors selected families, and imports a synthetic snapshot', async () => {
+    await withEnv2(async () => {
+      const dir = join(FAKE_GIT_DIR, 'cadence-org');
+      mkdirSync(dir, { recursive: true });
+      const snapshotPath = join(dir, 'snapshot.json');
+      writeFileSync(snapshotPath, JSON.stringify({
+        exported_at: '2026-09-17T12:00:00.000Z',
+        workspace: { id: 'workspace-1', name: 'Synthetic Workspace' },
+        groups: [{ id: 'group-1', title: 'Alpha' }],
+        priorities: [{ id: 'priority-1', title: 'Rock', status: 'on_track' }],
+        people: [{ id: 'person-1', name: 'Must not enter organization target' }],
+      }));
+
+      const row = await addSource(engine, {
+        id: 'cadence-org',
+        force: true,
+        cadence: {
+          target: 'organization', account: 'synthetic-account', organization: 'synthetic-org',
+          families: ['groups'], tokenEnv: 'SYNTHETIC_CADENCE_TOKEN', dir,
+        },
+      });
+      await engine.executeRaw(`UPDATE sources SET config = config || $1::jsonb WHERE id = $2`, [JSON.stringify({ c_snapshot: snapshotPath }), row.id]);
+      expect(row.config).toMatchObject({ kind: 'cadence', c_account: 'synthetic-account', c_organization: 'synthetic-org', c_target: 'organization', c_families: 'groups' });
+
+      const result = await performSync(engine, { sourceId: row.id, repoPath: dir, noPull: true, noEmbed: true, skipLock: true });
+      expect(['first_sync', 'synced', 'up_to_date']).toContain(result.status);
+      expect(result.added).toBe(1);
+      const pages = await engine.executeRaw<{ slug: string }>(`SELECT slug FROM pages WHERE source_id = $1`, [row.id]);
+      expect(pages.map((page) => page.slug)).toEqual(['cadence/organization/groups/group-1']);
+    });
+  });
+
+  test('rejects a managed directory overlap before registration', async () => {
+    await withEnv2(async () => {
+      const dir = join(FAKE_GIT_DIR, 'cadence-overlap');
+      mkdirSync(dir, { recursive: true });
+      await addSource(engine, { id: 'cadence-parent', localPath: dir, force: true });
+      await expect(addSource(engine, { id: 'cadence-child', localPath: join(dir, 'child'), force: true, cadence: { target: 'organization', families: ['groups'], tokenEnv: 'SYNTHETIC_CADENCE_TOKEN', dir: join(dir, 'child') } })).rejects.toThrow(/overlaps with existing source/);
     });
   });
 });

@@ -180,6 +180,7 @@ export const __testing = { parseSnapshot, normalizeGroups };
 /** DB-source sync adapter. This is the production-wired path; unlike the
  * IngestionSource wrapper it awaits every import before advancing the cursor. */
 export type CadenceTarget = 'organization' | 'personnel';
+export type CadenceFamily = 'groups' | 'priorities' | 'projects' | 'measurables' | 'tasks' | 'aor_updates' | 'people' | 'checkins' | 'pulse_reflections';
 export interface CadenceSourceConfig {
   kind: 'cadence';
   target: CadenceTarget;
@@ -192,6 +193,7 @@ export interface CadenceSourceConfig {
   tokenEnv?: string;
   /** Reserved runtime vault reference; the secret itself is never persisted. */
   tokenVault?: string;
+  families?: CadenceFamily[];
   endpoint?: string;
 }
 
@@ -209,11 +211,23 @@ const MAX_PROVIDER_PAGES = 100;
 
 export function parseCadenceSourceConfig(config: Record<string, unknown>, fallbackDir: string): CadenceSourceConfig {
   if (config.kind !== 'cadence') throw new Error('Cadence source requires config.kind="cadence"');
-  const target = config.c_target === 'personnel' || config.cadence_target === 'personnel' || config.target === 'personnel' ? 'personnel' : 'organization';
+  if (Object.prototype.hasOwnProperty.call(config, 'c_token')) {
+    throw new Error('Cadence c_token inline secret config is rejected; use c_token_env or c_token_vault');
+  }
+  const rawTarget = config.c_target ?? config.cadence_target ?? config.target;
+  // Older fixture rows predate target persistence and are organization-shaped.
+  // Registration still requires an explicit target; this parser fallback only
+  // keeps those rows readable without broadening the personnel boundary.
+  const target = rawTarget === 'ceo' || rawTarget === 'personnel' ? 'personnel' : rawTarget === 'organization' || rawTarget === undefined ? 'organization' : (() => { throw new Error('Cadence source requires explicit target "ceo" or "organization"'); })();
   const personnelTarget = config.c_personnel_target ?? config.cadence_personnel_target;
-  if (target === 'personnel' && personnelTarget !== 'ceo') {
+  if (target === 'personnel' && personnelTarget !== undefined && personnelTarget !== 'ceo') {
     throw new Error('Cadence personnel target is restricted to explicit CEO target');
   }
+  const rawFamilies = typeof config.c_families === 'string' ? config.c_families.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+  const allowedFamilies = new Set<CadenceFamily>(['groups', 'priorities', 'projects', 'measurables', 'tasks', 'aor_updates', 'people', 'checkins', 'pulse_reflections']);
+  const families = rawFamilies?.map((family) => { if (!allowedFamilies.has(family as CadenceFamily)) throw new Error(`Unknown Cadence family: ${family}`); return family as CadenceFamily; });
+  const personnelFamilies = new Set<CadenceFamily>(['people', 'checkins', 'pulse_reflections']);
+  if (families?.length && (target === 'organization' ? families.some((f) => personnelFamilies.has(f)) : families.some((f) => !personnelFamilies.has(f)))) throw new Error('Cadence family subscription does not match its target');
   const dir = typeof config.c_dir === 'string' && config.c_dir.length > 0 ? config.c_dir : fallbackDir;
   const account = config.c_account ?? config.cadence_account;
   const organization = config.c_organization ?? config.cadence_organization ?? config.organization_id;
@@ -222,10 +236,9 @@ export function parseCadenceSourceConfig(config: Record<string, unknown>, fallba
     ...(typeof account === 'string' ? { account } : {}),
     ...(typeof organization === 'string' ? { organization } : {}),
     ...(target === 'personnel' ? { personnelTarget: 'ceo' as const } : {}),
+    ...(families ? { families } : {}),
     ...(typeof config.c_snapshot === 'string' ? { snapshotPath: config.c_snapshot } : {}),
-    ...(Object.prototype.hasOwnProperty.call(config, 'c_token')
-      ? (() => { throw new Error('Cadence c_token inline secret config is rejected; use c_token_env or c_token_vault'); })()
-      : {}),
+
     ...(typeof config.c_token_env === 'string' && config.c_token_env.length > 0 ? { tokenEnv: config.c_token_env } : {}),
     ...(typeof config.c_token_vault === 'string' && config.c_token_vault.length > 0 ? { tokenVault: config.c_token_vault } : {}),
     ...(typeof config.c_endpoint === 'string' ? { endpoint: config.c_endpoint } : {}),
@@ -343,7 +356,7 @@ export async function runCadenceSync(
   else result = await (deps.provider ?? createCadenceProvider()).read(cfg, state.cursor, { signal: opts.signal });
   const raw = result.snapshot;
   if (!isObject(raw) || typeof raw.exported_at !== 'string') throw new Error('Cadence provider returned an invalid complete snapshot');
-  const records = recordsForTarget(raw, cfg.target);
+  const records = recordsForTarget(raw, cfg.target).filter((record) => !cfg.families || cfg.families.includes(record.family as CadenceFamily));
   const fingerprint = computeContentHash(canonicalJson({ exported_at: raw.exported_at, records }));
   if (fingerprint === state.fingerprint) return { status: 'up_to_date', fromCommit: state.cursor, toCommit: result.nextCursor ?? state.cursor ?? '', added: 0, modified: 0, deleted: 0, renamed: 0, chunksCreated: 0, embedded: 0, pagesAffected: [] };
   let added = 0, modified = 0, chunksCreated = 0; const pagesAffected: string[] = [];

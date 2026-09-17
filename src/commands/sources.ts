@@ -132,14 +132,16 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
   if (!id) {
     console.error(
-      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google] ' +
+      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google|cadence] ' +
         '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] [--force]\n' +
         '       github kind: [--token-env <env>] [--scope auto|repos] ' +
         '[--repos owner/name,...] [--dir <path>] ' +
         '[--app-id <n> --app-pem <path>] [--app-install <n>]\n' +
         '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
         '[--history-days <n>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
-        '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)',
+        '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)\n' +
+        '       cadence kind: --target ceo|organization --families <family,...> --token-env <VAR> [--account <id>] [--organization <id>] [--dir <path>]\n' +
+        '                    (CEO is the only personnel target; vault credentials fail closed)',
     );
     process.exit(2);
   }
@@ -170,6 +172,11 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   let gServices: string[] = ['gmail', 'calendar', 'contacts'];
   let gHistoryDays = 90;
   let gCalendarId: string = DEFAULT_CALENDAR_ID;
+  let cKind = false;
+  let cTarget: 'ceo' | 'organization' | undefined;
+  let cFamilies: string[] = [];
+  let cTokenEnv: string | undefined;
+  let cOrganization: string | undefined;
 
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
@@ -188,13 +195,26 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         ghKind = true;
       } else if (kind === 'google') {
         gKind = true;
+      } else if (kind === 'cadence') {
+        cKind = true;
       } else {
-        console.error(`Unknown source kind: ${kind}. Supported: "github", "google".`);
+        console.error(`Unknown source kind: ${kind}. Supported: "github", "google", "cadence".`);
         process.exit(2);
       }
       continue;
     }
     if (a === '--account') { gAccount = args[++i]?.trim().toLowerCase(); continue; }
+    if (a === '--organization') { cOrganization = args[++i]?.trim(); continue; }
+    if (a === '--target') {
+      const v = args[++i];
+      if (v !== 'ceo' && v !== 'organization') { console.error('--target must be "ceo" or "organization".'); process.exit(2); }
+      cTarget = v;
+      continue;
+    }
+    if (a === '--families' || a === '--family') {
+      cFamilies = (args[++i] ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      continue;
+    }
     if (a === '--access') { gAccess = args[++i]?.trim().toLowerCase(); continue; }
     if (a === '--token-command') { gTokenCommand = args[++i]; continue; }
     if (a === '--token-env') {
@@ -204,6 +224,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
       const v = args[++i]?.trim();
       gTokenEnv = v;
       ghTokenEnv = v;
+      cTokenEnv = v;
       continue;
     }
     if (a === '--services') {
@@ -282,6 +303,21 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   if (gKind && (remoteUrl || localPath || ghKind)) {
     console.error('Error: --kind google is mutually exclusive with --url, --path, and --kind github.');
     process.exit(2);
+  }
+  if (cKind && (remoteUrl || localPath || ghKind || gKind)) {
+    console.error('Error: --kind cadence is mutually exclusive with --url, --path, --kind github, and --kind google.');
+    process.exit(2);
+  }
+  if (cKind) {
+    const allowed = new Set(['groups', 'priorities', 'projects', 'measurables', 'tasks', 'aor_updates', 'people', 'checkins', 'pulse_reflections']);
+    const personnel = new Set(['people', 'checkins', 'pulse_reflections']);
+    if (!cTarget) { console.error('Error: --kind cadence requires explicit --target ceo|organization.'); process.exit(2); }
+    if (!cTokenEnv?.trim()) { console.error('Error: --kind cadence requires --token-env <ENV_VAR_NAME>; vault access is not implemented.'); process.exit(2); }
+    if (cFamilies.length === 0) { console.error('Error: --kind cadence requires --families <family,...>.'); process.exit(2); }
+    const bad = cFamilies.filter((family) => !allowed.has(family));
+    if (bad.length) { console.error(`Error: unknown Cadence family: ${bad.join(', ')}.`); process.exit(2); }
+    if (cTarget === 'organization' && cFamilies.some((family) => personnel.has(family))) { console.error('Error: organization target cannot subscribe to personnel families. Use --target ceo.'); process.exit(2); }
+    if (cTarget === 'ceo' && cFamilies.some((family) => !personnel.has(family))) { console.error('Error: CEO target can subscribe only to personnel families.'); process.exit(2); }
   }
   if (gKind && !gAccount) {
     console.error(
@@ -433,6 +469,15 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
             access: (gAccess ?? 'vault') as 'vault' | 'command' | 'env',
             tokenCommand: gTokenCommand,
             tokenEnv: gTokenEnv,
+          },
+        }
+      : {}),
+    ...(cKind
+      ? {
+          cadence: {
+            target: cTarget!, families: cFamilies, account: gAccount,
+            organization: cOrganization, tokenEnv: cTokenEnv!,
+            dir: ghDir ?? defaultCloneDir(`${id}-cadence`),
           },
         }
       : {}),

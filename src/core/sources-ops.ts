@@ -197,6 +197,15 @@ export interface AddSourceOpts {
     tokenCommand?: string;
     tokenEnv?: string;
   };
+  /** Cadence provider source; tokenEnv is an environment-variable name only. */
+  cadence?: {
+    target: 'ceo' | 'organization';
+    families: string[];
+    account?: string;
+    organization?: string;
+    tokenEnv: string;
+    dir: string;
+  };
 }
 
 export interface RemoveSourceOpts {
@@ -673,8 +682,26 @@ export async function addSource(
            VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
     );
+  } else if (opts.cadence) {
+    // Cadence is provider-read; only the environment variable name is stored.
+    const finalPath = opts.cadence.dir;
+    mkdirSync(finalPath, { recursive: true });
+    const config: Record<string, unknown> = {
+      kind: 'cadence', c_target: opts.cadence.target,
+      c_families: opts.cadence.families.join(','), c_token_env: opts.cadence.tokenEnv,
+      c_managed: finalPath === defaultCloneDir(`${opts.id}-cadence`),
+      federated: opts.federated ?? true,
+      ...(opts.cadence.account ? { c_account: opts.cadence.account } : {}),
+      ...(opts.cadence.organization ? { c_organization: opts.cadence.organization } : {}),
+    };
+    const displayName = opts.name ?? opts.id;
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+           VALUES ($1, $2, $3, $4::text::jsonb)`,
+      [opts.id, displayName, finalPath, JSON.stringify(config)],
+    );
   } else {
-    // ── Path B: --path or no path (existing behavior, pre-v0.28) ─────────
+    // ── Path B: --path or no path (existing behavior, pre-v0.28) ──────────
     // #2707: only validate when the path actually exists — a not-yet-created
     // path is a different (pre-existing, out of scope) failure mode, and
     // gating on existsSync keeps this a fail-fast check on the exact bug
@@ -960,12 +987,13 @@ export async function removeSource(
   const ghManaged = ghCfg.kind === 'github' && ghCfg.gh_managed === true;
   // v0.47: google-kind mirrors mark g_managed the same way.
   const gManaged = ghCfg.kind === 'google' && ghCfg.g_managed === true;
+  const cadenceManaged = ghCfg.kind === 'cadence' && ghCfg.c_managed === true;
   const cloneRoot = gbrainPath('clones');
   let cloneRemoved = false;
   if (
     !opts.keepStorage &&
     src.local_path &&
-    (remoteUrl || ghManaged || gManaged) && // only auto-clean when gbrain managed the dir
+    (remoteUrl || ghManaged || gManaged || cadenceManaged) && // only auto-clean when gbrain managed the dir
     isPathContained(src.local_path, cloneRoot)
   ) {
     try {
