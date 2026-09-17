@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { CadenceSnapshotSource, canonicalJson } from '../../../src/core/ingestion/sources/cadence.ts';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { CadenceSnapshotSource, canonicalJson, parseCadenceSourceConfig, runCadenceSync, cadenceStateFile } from '../../../src/core/ingestion/sources/cadence.ts';
 import { IngestionTestHarness } from '../../../src/core/ingestion/test-harness.ts';
 
 const snapshot = {
@@ -83,5 +85,23 @@ describe('CadenceSnapshotSource', () => {
 describe('canonicalJson', () => {
   test('sorts object keys recursively for stable hashes', () => {
     expect(canonicalJson({ b: 1, a: { d: 2, c: 3 } })).toBe('{"a":{"c":3,"d":2},"b":1}');
+  });
+
+  test('routes organization and explicitly CEO-targeted personnel sources', () => {
+    expect(parseCadenceSourceConfig({ kind: 'cadence', c_target: 'organization' }, '/tmp/org').target).toBe('organization');
+    expect(parseCadenceSourceConfig({ kind: 'cadence', c_target: 'personnel', c_personnel_target: 'ceo' }, '/tmp/people')).toMatchObject({ target: 'personnel', personnelTarget: 'ceo' });
+    expect(() => parseCadenceSourceConfig({ kind: 'cadence', c_target: 'personnel', c_personnel_target: 'other' }, '/tmp/no')).toThrow(/CEO/);
+  });
+
+  test('provider failure does not advance or create a cursor', async () => {
+    const dir = mkdtempSync(`${tmpdir()}/cadence-failure-`);
+    try {
+      const cfg = parseCadenceSourceConfig({ kind: 'cadence', c_target: 'organization', c_dir: dir }, dir);
+      const provider = { read: async () => { throw new Error('synthetic provider outage'); } };
+      await expect(runCadenceSync({} as never, 'cadence-test', cfg, { noEmbed: true }, { provider })).rejects.toThrow('synthetic provider outage');
+      expect(existsSync(cadenceStateFile(dir))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

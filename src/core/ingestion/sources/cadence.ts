@@ -12,7 +12,11 @@
  * synthesize narrative. Missing records are not tombstones: a complete
  * snapshot is an observation, and deletion/reconciliation belongs downstream.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { BrainEngine } from '../../engine.ts';
+import type { SyncOpts, SyncResult } from '../../../commands/sync.ts';
+import { importFromContent } from '../../import-file.ts';
 import { computeContentHash, type IngestionEvent, type IngestionSource, type IngestionSourceContext, type IngestionSourceHealth } from '../types.ts';
 
 export interface CadenceSnapshotSourceOpts {
@@ -170,3 +174,160 @@ export class CadenceSnapshotSource implements IngestionSource {
 }
 
 export const __testing = { parseSnapshot, normalizeGroups };
+
+
+
+/** DB-source sync adapter. This is the production-wired path; unlike the
+ * IngestionSource wrapper it awaits every import before advancing the cursor. */
+export type CadenceTarget = 'organization' | 'personnel';
+export interface CadenceSourceConfig {
+  kind: 'cadence';
+  target: CadenceTarget;
+  account?: string;
+  organization?: string;
+  personnelTarget?: 'ceo';
+  dir: string;
+  snapshotPath?: string;
+  token?: string;
+  endpoint?: string;
+}
+
+export interface CadenceReadResult {
+  snapshot: Record<string, unknown>;
+  nextCursor?: string | null;
+}
+export interface CadenceProvider {
+  read(config: CadenceSourceConfig, cursor: string | null, opts?: { signal?: AbortSignal }): Promise<CadenceReadResult>;
+}
+export interface CadenceSyncDeps { provider?: CadenceProvider; readFile?: (path: string) => string; }
+
+const PERSONNEL_FAMILIES = ['people', 'pulse_reflections', 'checkins'] as const;
+
+export function parseCadenceSourceConfig(config: Record<string, unknown>, fallbackDir: string): CadenceSourceConfig {
+  if (config.kind !== 'cadence') throw new Error('Cadence source requires config.kind="cadence"');
+  const target = config.c_target === 'personnel' || config.cadence_target === 'personnel' || config.target === 'personnel' ? 'personnel' : 'organization';
+  const personnelTarget = config.c_personnel_target ?? config.cadence_personnel_target;
+  if (target === 'personnel' && personnelTarget !== 'ceo') {
+    throw new Error('Cadence personnel target is restricted to explicit CEO target');
+  }
+  const dir = typeof config.c_dir === 'string' && config.c_dir.length > 0 ? config.c_dir : fallbackDir;
+  const account = config.c_account ?? config.cadence_account;
+  const organization = config.c_organization ?? config.cadence_organization ?? config.organization_id;
+  return {
+    kind: 'cadence', target, dir,
+    ...(typeof account === 'string' ? { account } : {}),
+    ...(typeof organization === 'string' ? { organization } : {}),
+    ...(target === 'personnel' ? { personnelTarget: 'ceo' as const } : {}),
+    ...(typeof config.c_snapshot === 'string' ? { snapshotPath: config.c_snapshot } : {}),
+    ...(typeof config.c_token === 'string' ? { token: config.c_token } : {}),
+    ...(typeof config.c_endpoint === 'string' ? { endpoint: config.c_endpoint } : {}),
+  };
+}
+
+export function cadenceStateFile(dir: string): string { return join(dir, '.cadence-source.json'); }
+function readCadenceState(dir: string): { cursor: string | null; fingerprint: string | null } {
+  const file = cadenceStateFile(dir);
+  if (!existsSync(file)) return { cursor: null, fingerprint: null };
+  try {
+    const state = JSON.parse(readFileSync(file, 'utf8')) as Partial<{ cursor: string | null; fingerprint: string | null }>;
+    return { cursor: state.cursor ?? null, fingerprint: state.fingerprint ?? null };
+  } catch (error) {
+    throw new Error(`Cadence state is corrupt: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+function writeCadenceState(dir: string, state: { cursor: string | null; fingerprint: string }): void {
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${cadenceStateFile(dir)}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, cadenceStateFile(dir));
+}
+
+function recordsForTarget(snapshot: Record<string, unknown>, target: CadenceTarget): SnapshotRecord[] {
+  if (target === 'organization') return parseSnapshot(snapshot).records.filter((r) => !PERSONNEL_FAMILIES.includes(r.family as typeof PERSONNEL_FAMILIES[number]));
+  if (snapshot.personnel === undefined && !PERSONNEL_FAMILIES.some((family) => snapshot[family] !== undefined)) {
+    throw new Error('Cadence CEO personnel read returned no personnel families');
+  }
+  const personnel = (isObject(snapshot.personnel) ? snapshot.personnel : snapshot) as Record<string, unknown>;
+  const out: SnapshotRecord[] = [];
+  for (const family of PERSONNEL_FAMILIES) {
+    const values = personnel[family] ?? [];
+    if (!Array.isArray(values)) throw new Error(`CadenceSnapshotSource: ${family} must be an array`);
+    for (const [index, value] of values.entries()) out.push({ family, id: requiredId(value, `${family}[${index}]`), value: value as JsonObject });
+  }
+  out.sort((a, b) => a.family.localeCompare(b.family) || a.id.localeCompare(b.id));
+  return out;
+}
+
+function cadenceMarkdown(record: SnapshotRecord, exportedAt: string): string {
+  return `---\ntitle: ${JSON.stringify(`${record.family} ${record.id}`)}\ncadence_family: ${record.family}\ncadence_record_id: ${JSON.stringify(record.id)}\ncadence_exported_at: ${JSON.stringify(exportedAt)}\n---\n\n${canonicalJson(record.value)}\n`;
+}
+
+/** Minimal MCP read client modeled on cadence-fetch.ts. Tests should inject a
+ * provider; this default has no credential lookup and never writes snapshots. */
+export function createCadenceProvider(fetchImpl: typeof fetch = fetch): CadenceProvider {
+  return { async read(config, cursor, opts) {
+    const endpoint = config.endpoint ?? 'https://cadence.schoolai.com/api/mcp';
+    const token = config.token ?? '';
+    if (!token) throw new Error('Cadence provider token is not configured');
+    let callId = 0;
+    const call = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+      const response = await fetchImpl(endpoint, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++callId, method: 'tools/call', params: { name, arguments: args } }), signal: opts?.signal });
+      if (!response.ok) throw new Error(`Cadence ${name} failed: HTTP ${response.status}`);
+      const rpc = await response.json() as { error?: { message?: string }; result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      if (rpc.error) throw new Error(`Cadence ${name} failed: ${rpc.error.message ?? 'RPC error'}`);
+      const text = rpc.result?.content?.[0]?.text;
+      if (!text || rpc.result?.isError) throw new Error(`Cadence ${name} returned no readable result`);
+      return JSON.parse(text);
+    };
+    const family = async (name: string, args: Record<string, unknown> = {}): Promise<unknown[]> => {
+      const rows: unknown[] = []; for (let offset = 0; ; offset += 100) {
+        const value = await call(name, { ...args, offset, limit: 100 });
+        const page = Array.isArray(value) ? value : ((value as Record<string, unknown>).items ?? (value as Record<string, unknown>)[name] ?? []) as unknown[];
+        rows.push(...page); if (page.length === 0 || (isObject(value) && value.hasMore === false)) return rows;
+      }
+    };
+    const snapshot: Record<string, unknown> = { exported_at: new Date().toISOString(), workspace: await call('workspace_metadata', {}) };
+    snapshot.groups = await family('people_read', { method: 'list_groups' });
+    snapshot.priorities = await family('rock_read', { method: 'list' });
+    snapshot.projects = await family('project_read', { method: 'list' });
+    snapshot.measurables = await family('measurable_read', { method: 'list' });
+    snapshot.tasks = await family('task_read', { method: 'list' });
+    snapshot.aor_updates = await family('people_read', { method: 'list_aor_updates', days: 30 });
+    if (config.target === 'personnel') {
+      snapshot.people = await family('people_read', { method: 'list_people', account: config.account ?? 'ceo' });
+      snapshot.checkins = await family('checkin_read', { method: 'latest_all', account: config.account ?? 'ceo', cursor });
+      snapshot.pulse_reflections = await family('pulse_read', { method: 'list', account: config.account ?? 'ceo', cursor });
+    }
+    return { snapshot, nextCursor: new Date().toISOString() };
+  } };
+}
+
+export async function runCadenceSync(
+  engine: BrainEngine,
+  sourceId: string,
+  cfg: CadenceSourceConfig,
+  opts: SyncOpts,
+  deps: CadenceSyncDeps = {},
+): Promise<SyncResult> {
+  if (cfg.target === 'personnel' && cfg.personnelTarget !== 'ceo') throw new Error('Cadence personnel sync denied: only explicit CEO target is permitted');
+  const state = readCadenceState(cfg.dir);
+  let result: CadenceReadResult;
+  if (cfg.snapshotPath) result = { snapshot: JSON.parse((deps.readFile ?? ((path) => readFileSync(path, 'utf8')))(cfg.snapshotPath)), nextCursor: state.cursor };
+  else result = await (deps.provider ?? createCadenceProvider()).read(cfg, state.cursor, { signal: opts.signal });
+  const raw = result.snapshot;
+  if (!isObject(raw) || typeof raw.exported_at !== 'string') throw new Error('Cadence provider returned an invalid complete snapshot');
+  const records = recordsForTarget(raw, cfg.target);
+  const fingerprint = computeContentHash(canonicalJson({ exported_at: raw.exported_at, records }));
+  if (fingerprint === state.fingerprint) return { status: 'up_to_date', fromCommit: state.cursor, toCommit: result.nextCursor ?? state.cursor ?? '', added: 0, modified: 0, deleted: 0, renamed: 0, chunksCreated: 0, embedded: 0, pagesAffected: [] };
+  let added = 0, modified = 0, chunksCreated = 0; const pagesAffected: string[] = [];
+  for (const record of records) {
+    const slug = `cadence/${cfg.target}/${record.family}/${record.id}`;
+    const existing = await engine.executeRaw<{ slug: string }>('SELECT slug FROM pages WHERE slug = $1 AND deleted_at IS NULL', [slug]);
+    const imported = await importFromContent(engine, slug, cadenceMarkdown(record, raw.exported_at), { noEmbed: opts.noEmbed ?? true, sourceId, sourcePath: `${record.family}/${record.id}.md` });
+    if (imported.status === 'error') throw new Error(imported.error ?? `Cadence import failed for ${slug}`);
+    if (imported.status === 'imported') { pagesAffected.push(imported.slug); chunksCreated += imported.chunks; if (existing.length) modified++; else added++; }
+  }
+  // Cursor/fingerprint is committed only after every page import succeeds.
+  writeCadenceState(cfg.dir, { cursor: result.nextCursor ?? state.cursor, fingerprint });
+  return { status: 'synced', fromCommit: state.cursor, toCommit: result.nextCursor ?? state.cursor ?? '', added, modified, deleted: 0, renamed: 0, chunksCreated, embedded: 0, pagesAffected };
+}

@@ -1384,6 +1384,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const cfg = parseGoogleSourceConfig(rawCfg, fallbackDir);
         return await runGoogleSync(engine, srcId, cfg, opts);
       }
+      // v0.47: Cadence is a provider-read source. Keep snapshot bootstrap
+      // available, but await imports before persisting the provider cursor.
+      if (rawCfg.kind === 'cadence') {
+        serr(`[gbrain phase] sync.cadence_materialize`);
+        const { parseCadenceSourceConfig, runCadenceSync } = await import('../core/ingestion/sources/cadence.ts');
+        const { defaultCloneDir } = await import('../core/sources-ops.ts');
+        const fallbackDir = cfgRows[0].local_path ?? defaultCloneDir(`${srcId}-cadence`);
+        const cfg = parseCadenceSourceConfig(rawCfg, fallbackDir);
+        return await runCadenceSync(engine, srcId, cfg, opts);
+      }
       if (opts.githubItem) {
         throw new Error(
           `github_item refresh requires a github-kind source, but "${srcId}" is not github-kind.`,
