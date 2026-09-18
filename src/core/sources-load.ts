@@ -177,6 +177,11 @@ export function sourceLocalPathSkipWarning(
 ): string | null {
   const relative = relativeSourceLocalPathSkipWarning(sourceId, localPath);
   if (relative) return relative;
+  // Native provider sources materialize through their adapter and do not
+  // require a pre-existing checkout at local_path. Let sync create the
+  // provider state directory; treating it like a filesystem source makes
+  // autopilot silently skip a valid registered Cadence source.
+  if (parseSourceConfig(config).kind === 'cadence') return null;
   if (pathExists(localPath)) return null;
   if (sourceHasRecoverableManagedClone(config)) return null;
   return (

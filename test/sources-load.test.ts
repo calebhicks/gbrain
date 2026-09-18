@@ -232,6 +232,12 @@ describe('sourceLocalPathSkipWarning', () => {
     ).toBeNull();
   });
 
+  test('allows missing native Cadence state directories to reach adapter sync', () => {
+    expect(
+      sourceLocalPathSkipWarning('cadence', '/missing/cadence-state', () => false, { kind: 'cadence' }),
+    ).toBeNull();
+  });
+
   test('still skips missing unowned remote-url paths', () => {
     const warn = sourceLocalPathSkipWarning(
       'foreign',
