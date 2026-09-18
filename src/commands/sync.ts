@@ -1384,6 +1384,17 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const cfg = parseGoogleSourceConfig(rawCfg, fallbackDir);
         return await runGoogleSync(engine, srcId, cfg, opts);
       }
+      // Granola is a CEO-only provider source. Keep mirror bootstrap support,
+      // but use the native API adapter whenever a runtime credential pointer
+      // is configured; credentials never enter sources.config.
+      if (rawCfg.kind === 'granola') {
+        serr(`[gbrain phase] sync.granola_materialize`);
+        const { parseGranolaSourceConfig, runGranolaSync } = await import('../core/granola/granola-source.ts');
+        const { defaultCloneDir } = await import('../core/sources-ops.ts');
+        const fallbackDir = cfgRows[0].local_path ?? defaultCloneDir(`${srcId}-granola`);
+        const cfg = parseGranolaSourceConfig(rawCfg, fallbackDir);
+        return await runGranolaSync(engine, srcId, cfg, opts);
+      }
       if (opts.githubItem) {
         throw new Error(
           `github_item refresh requires a github-kind source, but "${srcId}" is not github-kind.`,

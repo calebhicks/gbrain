@@ -54,6 +54,7 @@ import {
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
 import { DEFAULT_CALENDAR_ID } from './google/types.ts';
+import { GRANOLA_KIND } from './granola/granola-source.ts';
 import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -196,6 +197,19 @@ export interface AddSourceOpts {
     access?: 'vault' | 'command' | 'env';
     tokenCommand?: string;
     tokenEnv?: string;
+  };
+  /** CEO-only native Granola registration. Credentials are pointers, never secrets. */
+  granola?: {
+    target: 'ceo';
+    account: string;
+    access: 'vault' | 'env' | 'command';
+    credentialId?: string;
+    tokenEnv?: string;
+    tokenCommand?: string;
+    dir: string;
+    mirrorDir?: string;
+    apiBase?: string;
+    batchSize?: number;
   };
 }
 
@@ -472,8 +486,17 @@ export async function addSource(
   }
   if (opts.google) {
     // Same #3696 phantom-path class as the github dir above.
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- opts.google.dir only flows here from the trusted local CLI (sources_add hard-rejects opts.google unless ctx.remote === false); absolutizing the operator's own directory is the #3696 fix
+    // nosemgrep: trusted local CLI path, normalized before persistence
     opts = { ...opts, google: { ...opts.google, dir: resolvePath(msysToNativePath(opts.google.dir)) } };
+  }
+  if (opts.granola) {
+    if (opts.granola.target !== 'ceo') throw new SourceOpError('invalid_id', 'Granola sources may target only the CEO account.');
+    if (!opts.granola.account.trim()) throw new SourceOpError('invalid_id', 'Granola sources require an explicit account.');
+    if (opts.granola.access === 'env' && (!opts.granola.tokenEnv || !/^[A-Z_][A-Z0-9_]*$/.test(opts.granola.tokenEnv))) throw new SourceOpError('invalid_id', 'Granola env access requires an environment-variable name, not a credential value.');
+    if (opts.granola.access === 'command' && !opts.granola.tokenCommand?.trim()) throw new SourceOpError('invalid_id', 'Granola command access requires a command pointer.');
+    if (opts.granola.access === 'vault' && (opts.granola.tokenEnv || opts.granola.tokenCommand)) throw new SourceOpError('invalid_id', 'Granola vault access cannot include token pointers.');
+    // nosemgrep: trusted local CLI path, normalized before persistence
+    opts = { ...opts, granola: { ...opts.granola, dir: resolvePath(msysToNativePath(opts.granola.dir)), ...(opts.granola.mirrorDir ? { mirrorDir: resolvePath(msysToNativePath(opts.granola.mirrorDir)) } : {}) } };
   }
 
   // Q4: pre-flight collision check before any clone work.
@@ -493,7 +516,8 @@ export async function addSource(
     !!opts.localPath &&
     !opts.remoteUrl &&
     !opts.github &&
-    !opts.google;
+    !opts.google &&
+    !opts.granola;
   if (existing.length > 0 && !attachPath) {
     const pathNote = existing[0]!.local_path
       ? ` with local_path ${existing[0]!.local_path}`
@@ -524,6 +548,8 @@ export async function addSource(
   let finalPath = opts.localPath ?? null;
   if (parsedUrl) {
     finalPath = opts.cloneDir ?? defaultCloneDir(opts.id);
+  } else if (opts.granola) {
+    finalPath = opts.granola.dir;
   }
   if (finalPath) await assertNoOverlappingPath(engine, opts.id, finalPath);
 
@@ -671,6 +697,30 @@ export async function addSource(
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config)
            VALUES ($1, $2, $3, $4::text::jsonb)`,
+      [opts.id, displayName, finalPath, JSON.stringify(config)],
+    );
+  } else if (opts.granola) {
+    // ── Path E: --kind granola ─────────────────────────────────────────────
+    const finalPath = opts.granola.dir;
+    mkdirSync(finalPath, { recursive: true });
+    const config: Record<string, unknown> = {
+      kind: GRANOLA_KIND,
+      gr_target: 'ceo',
+      gr_account: opts.granola.account.trim().toLowerCase(),
+      gr_access: opts.granola.access,
+      ...(opts.granola.credentialId ? { gr_credential_id: opts.granola.credentialId } : {}),
+      ...(opts.granola.tokenEnv ? { gr_token_env: opts.granola.tokenEnv } : {}),
+      ...(opts.granola.tokenCommand ? { gr_token_command: opts.granola.tokenCommand } : {}),
+      ...(opts.granola.mirrorDir ? { gr_mirror_dir: opts.granola.mirrorDir } : {}),
+      ...(opts.granola.apiBase ? { gr_api_base: opts.granola.apiBase } : {}),
+      ...(opts.granola.batchSize !== undefined ? { gr_batch_size: opts.granola.batchSize } : {}),
+      gr_dir: finalPath,
+      gr_managed: true,
+      federated: opts.federated ?? true,
+    };
+    const displayName = opts.name ?? opts.id;
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config) VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
     );
   } else {

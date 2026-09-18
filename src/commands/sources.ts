@@ -132,14 +132,16 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
   if (!id) {
     console.error(
-      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google] ' +
+      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google|granola] ' +
         '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] [--force]\n' +
         '       github kind: [--token-env <env>] [--scope auto|repos] ' +
         '[--repos owner/name,...] [--dir <path>] ' +
         '[--app-id <n> --app-pem <path>] [--app-install <n>]\n' +
         '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
         '[--history-days <n>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
-        '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)',
+        '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)\n' +
+        '       granola kind: --target ceo --account <account> --access vault|env|command [--credential-id <id>] ' +
+        '[--token-env <VAR>] [--token-command "<cmd>"] [--dir <path>] [--mirror-dir <path>] [--api-base <https-url>] [--batch-size <n>] (pointers only; no inline secrets)',
     );
     process.exit(2);
   }
@@ -170,6 +172,17 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   let gServices: string[] = ['gmail', 'calendar', 'contacts'];
   let gHistoryDays = 90;
   let gCalendarId: string = DEFAULT_CALENDAR_ID;
+  // v0.49 native Granola flags.
+  let granolaKind = false;
+  let granolaTarget: string | undefined;
+  let granolaAccess: 'vault' | 'env' | 'command' | undefined;
+  let granolaCredentialId: string | undefined;
+  let granolaTokenEnv: string | undefined;
+  let granolaTokenCommand: string | undefined;
+  let granolaDir: string | undefined;
+  let granolaMirrorDir: string | undefined;
+  let granolaApiBase: string | undefined;
+  let granolaBatchSize: number | undefined;
 
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
@@ -188,15 +201,32 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         ghKind = true;
       } else if (kind === 'google') {
         gKind = true;
+      } else if (kind === 'granola') {
+        granolaKind = true;
       } else {
-        console.error(`Unknown source kind: ${kind}. Supported: "github", "google".`);
+        console.error(`Unknown source kind: ${kind}. Supported: "github", "google", "granola".`);
         process.exit(2);
       }
       continue;
     }
     if (a === '--account') { gAccount = args[++i]?.trim().toLowerCase(); continue; }
-    if (a === '--access') { gAccess = args[++i]?.trim().toLowerCase(); continue; }
-    if (a === '--token-command') { gTokenCommand = args[++i]; continue; }
+    if (a === '--access') {
+      const access = args[++i]?.trim().toLowerCase();
+      gAccess = access;
+      if (access === 'vault' || access === 'env' || access === 'command') granolaAccess = access;
+      continue;
+    }
+    if (a === '--token-command') { gTokenCommand = args[++i]; granolaTokenCommand = gTokenCommand; continue; }
+    if (a === '--credential-id') { granolaCredentialId = args[++i]?.trim(); continue; }
+    if (a === '--target') { granolaTarget = args[++i]?.trim().toLowerCase(); continue; }
+    if (a === '--mirror-dir') { granolaMirrorDir = args[++i]; continue; }
+    if (a === '--api-base') { granolaApiBase = args[++i]?.trim(); continue; }
+    if (a === '--batch-size') {
+      const v = Number(args[++i]);
+      if (!Number.isInteger(v) || v <= 0) { console.error('--batch-size must be a positive integer.'); process.exit(2); }
+      granolaBatchSize = v;
+      continue;
+    }
     if (a === '--token-env') {
       // Shared by BOTH kinds: github reads its API token from this env var;
       // google's env access mode reads an access token from it. Parsed once
@@ -204,6 +234,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
       const v = args[++i]?.trim();
       gTokenEnv = v;
       ghTokenEnv = v;
+      granolaTokenEnv = v;
       continue;
     }
     if (a === '--services') {
@@ -247,7 +278,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         .filter(Boolean);
       continue;
     }
-    if (a === '--dir') { ghDir = args[++i]; continue; }
+    if (a === '--dir') { ghDir = args[++i]; granolaDir = ghDir; continue; }
     if (a === '--app-id') {
       const v = Number(args[++i]);
       if (!Number.isInteger(v) || v <= 0) {
@@ -282,6 +313,33 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   if (gKind && (remoteUrl || localPath || ghKind)) {
     console.error('Error: --kind google is mutually exclusive with --url, --path, and --kind github.');
     process.exit(2);
+  }
+  if (granolaKind && (remoteUrl || localPath || ghKind || gKind)) {
+    console.error('Error: --kind granola is mutually exclusive with --url, --path, --kind github, and --kind google.');
+    process.exit(2);
+  }
+  if (granolaKind) {
+    if (granolaTarget !== undefined && granolaTarget !== 'ceo') {
+      console.error('Error: Granola sources may target only --target ceo.');
+      process.exit(2);
+    }
+    if (!gAccount) {
+      console.error('Error: --kind granola requires --account <account>.');
+      process.exit(2);
+    }
+    const access = granolaAccess ?? 'vault';
+    if (access === 'env' && (!granolaTokenEnv || !/^[A-Z_][A-Z0-9_]*$/.test(granolaTokenEnv))) {
+      console.error('Error: Granola --access env requires --token-env <ENV_VAR_NAME>.');
+      process.exit(2);
+    }
+    if (access === 'command' && !granolaTokenCommand?.trim()) {
+      console.error('Error: Granola --access command requires --token-command "<cmd>".');
+      process.exit(2);
+    }
+    if (access === 'vault' && (granolaTokenEnv || granolaTokenCommand)) {
+      console.error('Error: Granola --access vault cannot include token pointers.');
+      process.exit(2);
+    }
   }
   if (gKind && !gAccount) {
     console.error(
@@ -433,6 +491,22 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
             access: (gAccess ?? 'vault') as 'vault' | 'command' | 'env',
             tokenCommand: gTokenCommand,
             tokenEnv: gTokenEnv,
+          },
+        }
+      : {}),
+    ...(granolaKind
+      ? {
+          granola: {
+            target: 'ceo' as const,
+            account: gAccount!,
+            access: (granolaAccess ?? 'vault') as 'vault' | 'env' | 'command',
+            credentialId: granolaCredentialId,
+            tokenEnv: granolaTokenEnv,
+            tokenCommand: granolaTokenCommand,
+            dir: granolaDir ?? defaultCloneDir(`${id}-granola`),
+            mirrorDir: granolaMirrorDir,
+            apiBase: granolaApiBase,
+            batchSize: granolaBatchSize,
           },
         }
       : {}),
